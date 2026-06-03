@@ -1,0 +1,91 @@
+services:
+
+  traefik:
+    image: traefik:v3
+    container_name: migratrix-traefik
+    restart: unless-stopped
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.filename=/etc/traefik/tls.yml"
+      - "--entrypoints.agent.address=:4002"
+      - "--entrypoints.websecure.address=:443"
+      - "--serversTransport.insecureSkipVerify=true"
+    ports:
+      - "${AGENT_PORT:-4002}:4002"
+      - "${HTTPS_PORT:-443}:443"
+      - "${DASHBOARD_PORT:-8080}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik-tls.yml:/etc/traefik/tls.yml:ro
+      - ./certs:/certs:ro
+    depends_on:
+      - agent
+      - risk-assessment
+
+  agent:
+    image: ${REGISTRY:-}migratrix-agent:${TAG:-latest}
+    container_name: migratrix-agent
+    restart: unless-stopped
+    command: ["--apikey", "${MIGRATRIX_API_KEY}"]
+    environment:
+      ASPNETCORE_URLS: "http://0.0.0.0:4002"
+      MIGRATRIX_DIR: /data/migratrix
+    volumes:
+      - migratrix-data:/data/migratrix
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - risk-assessment
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.agent.entrypoints=websecure"
+      - "traefik.http.routers.agent.rule=Host(`${AGENT_HOST:-agent.localhost}`) && PathPrefix(`/`)"
+      - "traefik.http.routers.agent.tls=true"
+      - "traefik.http.routers.agent.priority=1"
+      - "traefik.http.services.agent.loadbalancer.server.port=4002"
+      - "traefik.http.services.agent.loadbalancer.server.scheme=http"
+
+  risk-assessment:
+    image: ${REGISTRY:-}migratrix-risk-assessment:${TAG:-latest}
+    container_name: migratrix-risk-assessment
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_URLS: "http://0.0.0.0:4003"
+      JavaGrpc__Endpoint:   "http://java-analyzer:50051"
+      PythonGrpc__Endpoint: "http://python-analyzer:50052"
+      SqlGlot__BaseUrl:     "http://sqlglot:5123"
+      SqlGlot__Enabled:     "true"
+    volumes:
+      - migratrix-data:/data/migratrix
+    depends_on:
+      - java-analyzer
+      - python-analyzer
+      - sqlglot
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.risk.entrypoints=websecure"
+      - "traefik.http.routers.risk.rule=Host(`${AGENT_HOST:-agent.localhost}`) && PathPrefix(`/hubs/riskAssessment`)"
+      - "traefik.http.routers.risk.tls=true"
+      - "traefik.http.routers.risk.priority=10"
+      - "traefik.http.services.risk.loadbalancer.server.port=4003"
+      - "traefik.http.services.risk.loadbalancer.server.scheme=http"
+
+  java-analyzer:
+    image: ${REGISTRY:-}migratrix-java-analyzer:${TAG:-latest}
+    container_name: migratrix-java-analyzer
+    restart: unless-stopped
+
+  python-analyzer:
+    image: ${REGISTRY:-}migratrix-python-analyzer:${TAG:-latest}
+    container_name: migratrix-python-analyzer
+    restart: unless-stopped
+
+  sqlglot:
+    image: ${REGISTRY:-}migratrix-sqlglot-parser:${TAG:-latest}
+    container_name: migratrix-sqlglot
+    restart: unless-stopped
+
+volumes:
+  migratrix-data:
