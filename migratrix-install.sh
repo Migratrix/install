@@ -1,20 +1,4 @@
 #!/usr/bin/env bash
-#
-# migratrix-install — one-shot local setup for the Migratrix agent (macOS / Linux).
-#
-# It will:
-#   1. install mkcert (via your package manager) if it isn't already present
-#   2. install mkcert's local CA into the system + browser trust stores
-#   3. generate a TLS cert for HOST into ./certs
-#   4. point Traefik's file provider (traefik-tls.yml) at that cert
-#   5. add a /etc/hosts entry for non-*.localhost hosts
-#   6. write HOST + API key into .env (consumed by both compose files)
-#
-# Usage:
-#   scripts/migratrix-install.sh --host <HOST> --api-key <API_KEY>
-#
-# Defaults: HOST=agent.localhost
-#
 set -euo pipefail
 
 HOST="agent.localhost"
@@ -88,17 +72,13 @@ if ! command -v mkcert >/dev/null 2>&1; then
 fi
 command -v mkcert >/dev/null 2>&1 || { echo "error: mkcert still not on PATH after install" >&2; exit 1; }
 
-# --- 2. install the local CA into system + browser trust stores ------------
 mkcert -install
-
-# --- 3. generate a cert for HOST -------------------------------------------
 mkdir -p "$CERTS_DIR"
 CERT_PEM="$CERTS_DIR/$HOST.pem"
 KEY_PEM="$CERTS_DIR/$HOST-key.pem"
 mkcert -cert-file "$CERT_PEM" -key-file "$KEY_PEM" "$HOST" "*.localhost" localhost 127.0.0.1 ::1
 echo "Generated $CERT_PEM"
 
-# --- 4. point Traefik's file provider at the new cert ----------------------
 cat > "$TLS_FILE" <<EOF
 tls:
   certificates:
