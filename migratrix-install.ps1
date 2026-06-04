@@ -115,8 +115,8 @@ if ($GithubToken) {
 }
 
 Write-Host ""
-Write-Host "Done. Bring the stack up with one of:" -ForegroundColor Green
-Write-Host "   Production:  docker compose up -d"
-Write-Host "   Local dev:   docker compose -f docker-compose.local.yml up -d --build"
+Write-Host "Done. Start the agent:" -ForegroundColor Green
+Write-Host "   cd `"$RepoRoot`""
+Write-Host "   docker compose up -d"
 Write-Host ""
 Write-Host "   Agent will be reachable at: https://$HostName"
