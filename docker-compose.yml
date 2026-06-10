@@ -45,7 +45,7 @@ services:
       - "traefik.http.routers.agent.tls=true"
       - "traefik.http.routers.agent.priority=1"
       - "traefik.http.services.agent.loadbalancer.server.port=4002"
-      - "traefik.http.services.agent.loadbalancer.server.scheme=http"
+      - "traefik.http.services.agent.loadbalancer.server.scheme=https"
 
   risk-assessment:
     image: ${REGISTRY:-}migratrix-risk-assessment:${TAG:-latest}
