@@ -8,7 +8,8 @@ services:
       - "--api.insecure=true"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
-      - "--providers.file.filename=/etc/traefik/tls.yml"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
       - "--entrypoints.agent.address=:4002"
       - "--entrypoints.websecure.address=:443"
       - "--serversTransport.insecureSkipVerify=true"
@@ -18,7 +19,7 @@ services:
       - "${DASHBOARD_PORT:-8080}:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik-tls.yml:/etc/traefik/tls.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
       - ./certs:/certs:ro
     depends_on:
       - agent
@@ -28,20 +29,41 @@ services:
     image: ${REGISTRY:-}migratrix-agent:${TAG:-latest}
     container_name: migratrix-agent
     restart: unless-stopped
+    # Replica workers finish the batch in hand, save the checkpoint and release their lease on a stop
+    # (the host gives them 60 s); Docker's default of 10 s would kill the agent before that (LS2-08).
+    stop_grace_period: 75s
     command: ["--apikey", "${MIGRATRIX_API_KEY}"]
     environment:
       ASPNETCORE_URLS: "http://0.0.0.0:4002"
+      # The orchestrator this agent belongs to. The Platform's tokens are validated with the public keys it
+      # publishes at /.well-known/jwks.json: the agent holds no key that could sign one.
+      ApiSettings__BaseUrl: "${MIGRATRIX_ORCHESTRATOR_URL:-https://api.migratrix.com}"
       MIGRATRIX_DIR: /data/migratrix
+      CERT_DIR: /certs
+      TRAEFIK_DYNAMIC_DIR: /etc/traefik/dynamic
+      AGENT_HOST: "${AGENT_HOST:-agent.localhost}"
+      MIGRATRIX_MODE: "${MIGRATRIX_MODE:-localhost}"
+      SqlGlot__BaseUrl: "http://sqlglot:5123"
+      SqlGlot__Enabled: "true"
+      # The Data MCP for AI assistants, at https://<AGENT_HOST>/mcp. TLS ends at Traefik, so the public name tokens
+      # are minted for is given here. MIGRATRIX_DATA_MCP=off turns the endpoint off.
+      MIGRATRIX_DATA_MCP: "${MIGRATRIX_DATA_MCP:-on}"
+      MIGRATRIX_DATA_MCP_RESOURCE: "https://${AGENT_HOST:-agent.localhost}/mcp"
+      # The Risk Assessment API beside the agent: turns on code_impact on the Executor MCP.
+      MIGRATRIX_RISK_URL: "http://risk-assessment:4003"
     volumes:
       - migratrix-data:/data/migratrix
+      - ./certs:/certs
+      - ./traefik/dynamic:/etc/traefik/dynamic
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       - risk-assessment
+      - sqlglot
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.agent.entrypoints=websecure"
-      - "traefik.http.routers.agent.rule=Host(`${AGENT_HOST:-agent.localhost}`) && PathPrefix(`/`)"
+      - "traefik.http.routers.agent.rule=PathPrefix(`/`)"
       - "traefik.http.routers.agent.tls=true"
       - "traefik.http.routers.agent.priority=1"
       - "traefik.http.services.agent.loadbalancer.server.port=4002"
@@ -53,10 +75,19 @@ services:
     restart: unless-stopped
     environment:
       ASPNETCORE_URLS: "http://0.0.0.0:4003"
+      # Validates the Platform's tokens with the orchestrator's published public keys, like the agent.
+      ApiSettings__BaseUrl: "${MIGRATRIX_ORCHESTRATOR_URL:-https://api.migratrix.com}"
       JavaGrpc__Endpoint:   "http://java-analyzer:50051"
       PythonGrpc__Endpoint: "http://python-analyzer:50052"
       SqlGlot__BaseUrl:     "http://sqlglot:5123"
       SqlGlot__Enabled:     "true"
+      # Push webhooks reindex the changed files (https://<AGENT_HOST>/webhooks/github or /webhooks/gitlab). Without a
+      # secret the endpoint answers 503. The installer generates the GitHub secret; enter the same value as the
+      # webhook's Secret in GitHub (content type application/json, push events).
+      Webhooks__GitHubSecret: "${MIGRATRIX_GITHUB_WEBHOOK_SECRET:-}"
+      Webhooks__GitLabToken:  "${MIGRATRIX_GITLAB_WEBHOOK_TOKEN:-}"
+      # The Platform origin the Risk page is opened from, when it is not the hosted Platform (on-prem).
+      Cors__AllowedOrigins__0: "${MIGRATRIX_PLATFORM_ORIGIN:-}"
     volumes:
       - migratrix-data:/data/migratrix
     depends_on:
@@ -66,7 +97,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.risk.entrypoints=websecure"
-      - "traefik.http.routers.risk.rule=Host(`${AGENT_HOST:-agent.localhost}`) && PathPrefix(`/hubs/riskAssessment`)"
+      - "traefik.http.routers.risk.rule=PathPrefix(`/hubs/riskAssessment`) || PathPrefix(`/webhooks/github`) || PathPrefix(`/webhooks/gitlab`)"
       - "traefik.http.routers.risk.tls=true"
       - "traefik.http.routers.risk.priority=10"
       - "traefik.http.services.risk.loadbalancer.server.port=4003"

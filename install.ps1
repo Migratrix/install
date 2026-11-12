@@ -5,8 +5,9 @@
 
 .DESCRIPTION
   Downloads the compose file, the .env template and the real installer into a
-  working directory, then hands off to the installer. The container images stay
-  private (ghcr.io) and are gated by -GithubToken.
+  working directory, then hands off to the installer. The installer pulls the
+  container images (ghcr.io): anonymously, or with -GithubToken when Migratrix gave
+  you a registry token.
 
 .EXAMPLE
   # Because args must pass through iex, create a scriptblock from the download:
@@ -18,10 +19,14 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$HostName = "agent.localhost",
+    [ValidateSet("localhost", "managed", "custom", "ip")]
+    [string]$Mode = "localhost",
+    [string]$HostName = "",
     [Parameter(Mandatory = $true)][string]$ApiKey,
+    [string]$OrchestratorUrl = "",
     [string]$GithubToken = "",
-    [string]$GithubUser = "migratrix-bot"
+    [string]$GithubUser = "migratrix-bot",
+    [switch]$NoPull
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,5 +50,13 @@ Fetch '.env.example'          '.env.example'
 Fetch 'migratrix-install.ps1' 'scripts\migratrix-install.ps1'
 
 Write-Host "Running installer..."
-& powershell -ExecutionPolicy Bypass -File 'scripts\migratrix-install.ps1' `
-    -HostName $HostName -ApiKey $ApiKey -GithubToken $GithubToken -GithubUser $GithubUser
+# Only the options that have a value: Windows PowerShell drops empty arguments to a native command, which would
+# shift the ones after them.
+$installArgs = @('-ExecutionPolicy', 'Bypass', '-File', 'scripts\migratrix-install.ps1',
+    '-Mode', $Mode, '-ApiKey', $ApiKey, '-GithubUser', $GithubUser)
+if ($HostName)        { $installArgs += @('-HostName', $HostName) }
+if ($OrchestratorUrl) { $installArgs += @('-OrchestratorUrl', $OrchestratorUrl) }
+if ($GithubToken)     { $installArgs += @('-GithubToken', $GithubToken) }
+if ($NoPull)          { $installArgs += '-NoPull' }
+& powershell @installArgs
+exit $LASTEXITCODE

@@ -4,8 +4,8 @@
 #
 # This is the PUBLIC one-liner entrypoint. It downloads the compose file, the
 # .env template and the real installer into a working directory, then hands off
-# to the installer. The container images themselves stay private (ghcr.io) and
-# are gated by --github-token.
+# to the installer. The installer pulls the container images (ghcr.io): anonymously,
+# or with --github-token when Migratrix gave you a registry token.
 #
 # Usage:
 #   curl -fsSL https://get.migratrix.com/install.sh | bash -s -- \
