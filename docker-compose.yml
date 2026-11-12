@@ -1,22 +1,22 @@
 services:
 
   traefik:
-    image: traefik:v3
+    # A fixed minor line, not the floating "v3" (SEC-07). 3.6 is the first line that talks to Docker Engine 29.
+    image: traefik:${TRAEFIK_TAG:-v3.6}
     container_name: migratrix-traefik
     restart: unless-stopped
     command:
-      - "--api.insecure=true"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--providers.file.watch=true"
       - "--entrypoints.agent.address=:4002"
       - "--entrypoints.websecure.address=:443"
-      - "--serversTransport.insecureSkipVerify=true"
     ports:
       - "${AGENT_PORT:-4002}:4002"
       - "${HTTPS_PORT:-443}:443"
-      - "${DASHBOARD_PORT:-8080}:8080"
+      # No dashboard port: Traefik's API and dashboard are off (they were open, without a login, on every
+      # interface - SEC-07).
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
@@ -32,8 +32,10 @@ services:
     # Replica workers finish the batch in hand, save the checkpoint and release their lease on a stop
     # (the host gives them 60 s); Docker's default of 10 s would kill the agent before that (LS2-08).
     stop_grace_period: 75s
-    command: ["--apikey", "${MIGRATRIX_API_KEY}"]
     environment:
+      # The agent key, from .env. Passed in the environment, not as a command argument: arguments show in the
+      # process list of the host and of every container that shares its PID namespace (SEC-06).
+      MIGRATRIX_API_KEY: "${MIGRATRIX_API_KEY:?MIGRATRIX_API_KEY is not set in .env - run the installer with the key from Settings > Agents}"
       ASPNETCORE_URLS: "http://0.0.0.0:4002"
       # The orchestrator this agent belongs to. The Platform's tokens are validated with the public keys it
       # publishes at /.well-known/jwks.json: the agent holds no key that could sign one.

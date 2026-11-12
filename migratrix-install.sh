@@ -3,18 +3,24 @@
 # migratrix-install — one-shot local setup for the Migratrix agent (macOS / Linux).
 #
 # Prepares the working directory for `docker compose up`, tailored to a TLS mode:
-#   localhost  mkcert-trusted cert for agent.localhost           (default; local dev)
+#   localhost  mkcert-trusted cert for agent.localhost   (default on a machine with a desktop: the agent is
+#              reached by a browser on this same machine only)
 #   managed    Migratrix issues a subdomain + cert when the agent registers
-#   custom     your domain; cert uploaded in Account Settings, pushed on register
-#   ip         direct IP;  cert uploaded in Account Settings, pushed on register
+#   custom     your domain; cert uploaded in Settings → Agents → Configure Agent, pushed on register
+#   ip         direct IP;  cert uploaded in Settings → Agents → Configure Agent, pushed on register
+#
+# On a server without a desktop there is no default: choose --mode managed, custom or ip.
 #
 # Every mode lays down ./certs, ./traefik/dynamic/tls.yml (a bootstrap cert so
 # Traefik serves TLS immediately) and .env. For non-localhost modes the agent
 # hot-swaps the real certificate in after it connects to the orchestrator.
 #
 # Usage:
-#   migratrix-install.sh --api-key <KEY> [--mode <MODE>] [--host <HOST>] [--orchestrator-url <URL>] \
+#   migratrix-install.sh [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url <URL>] \
 #                        [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
+#
+# The agent key: --api-key, or the MIGRATRIX_API_KEY environment variable, or - with neither - the installer asks
+# for it without echoing it (nothing in the shell history or the process list).
 #
 # Images: without --github-token the installer does not log in to the registry and pulls the images anonymously;
 # when the registry refuses, it stops with a message saying so (it never logs in with a placeholder).
@@ -24,7 +30,7 @@
 #
 set -euo pipefail
 
-MODE="localhost"
+MODE=""
 HOST=""
 API_KEY=""
 ORCHESTRATOR_URL=""
@@ -34,10 +40,13 @@ PULL=1
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 --api-key <KEY> [--mode <MODE>] [--host <HOST>] [--orchestrator-url <URL>] [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
+Usage: $0 [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url <URL>] [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
 
-  --api-key       Migratrix agent API key (required)
-  --mode          TLS mode: localhost (default) | managed | custom | ip
+  --api-key       Migratrix agent API key, from Settings → Agents in the Platform. Without it the installer
+                  reads MIGRATRIX_API_KEY from the environment, or asks for the key without echoing it.
+  --mode          How the agent is reached: localhost | managed | custom | ip
+                    localhost: a browser on this same machine only (default on a machine with a desktop)
+                    a server without a desktop has no default: choose managed, custom or ip
   --host          Hostname Traefik serves the agent on
                     localhost: defaults to agent.localhost
                     custom/ip: required (your domain / public IP)
@@ -65,13 +74,52 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# A Linux machine without a graphical session: nobody will open a browser on it, so https://agent.localhost and a
+# certificate trusted only by this machine are of no use (onboarding trials AGI-03).
+is_headless() {
+  [ "$(uname -s)" = "Linux" ] || return 1
+  [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${XDG_CURRENT_DESKTOP:-}" ]
+}
+
+if [ -z "$MODE" ]; then
+  if is_headless; then
+    cat >&2 <<EOF
+error: this machine has no desktop, so the default mode (localhost) would give an agent that only a browser on
+       this machine could reach. Choose how the agent is reached:
+         --mode managed                      Migratrix assigns a public name and certificate
+         --mode custom --host <your domain>  your own name; upload its certificate in Settings → Agents
+         --mode ip --host <address>          this machine's address; upload its certificate in Settings → Agents
+       (--mode localhost still installs the local-only setup, if that is what you want.)
+EOF
+    exit 1
+  fi
+  MODE="localhost"
+fi
+
 case "$MODE" in
   localhost) [ -n "$HOST" ] || HOST="agent.localhost" ;;
   custom|ip) [ -n "$HOST" ] || { echo "error: --host is required for --mode $MODE" >&2; usage; } ;;
   managed)   : ;; # hostname is assigned by Migratrix when the agent registers
   *) echo "error: invalid --mode '$MODE' (localhost|managed|custom|ip)" >&2; usage ;;
 esac
-[ -n "$API_KEY" ] || { echo "error: --api-key is required" >&2; usage; }
+
+# The agent key: the option, the environment, or a prompt that does not echo.
+[ -n "$API_KEY" ] || API_KEY="${MIGRATRIX_API_KEY:-}"
+[ -n "$GITHUB_TOKEN" ] || GITHUB_TOKEN="${MIGRATRIX_GITHUB_TOKEN:-}"
+if [ -z "$API_KEY" ] && ( : > /dev/tty ) 2>/dev/null; then
+  printf 'Migratrix agent API key (Settings → Agents in the Platform; input is hidden): ' > /dev/tty
+  IFS= read -rs API_KEY < /dev/tty || API_KEY=""
+  printf '\n' > /dev/tty
+fi
+[ -n "$API_KEY" ] || { echo "error: no agent API key: pass --api-key, or set MIGRATRIX_API_KEY" >&2; usage; }
+
+# Placeholders copied from an example are refused before anything is installed or written.
+case "$API_KEY" in
+  *xxxx*|"<"*">"|mgx_xxx) echo "error: the API key is a placeholder; copy the real key from Settings → Agents in the Platform" >&2; exit 1 ;;
+esac
+case "$GITHUB_TOKEN" in
+  *xxxx*|"<"*">") echo "error: --github-token is a placeholder; leave it out to pull anonymously, or pass the token Migratrix gave you" >&2; exit 1 ;;
+esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CERTS_DIR="$REPO_ROOT/certs"
@@ -134,7 +182,9 @@ if [ ! -f "$ENV_FILE" ] && [ -f "$REPO_ROOT/.env.example" ]; then
   cp "$REPO_ROOT/.env.example" "$ENV_FILE"
   echo "Seeded $ENV_FILE from .env.example"
 fi
-touch "$ENV_FILE"
+# .env holds the agent key: its owner only (SEC-06).
+( umask 077; touch "$ENV_FILE" )
+chmod 600 "$ENV_FILE"
 set_env() {
   local key="$1" val="$2" tmp
   if grep -qE "^${key}=" "$ENV_FILE"; then
@@ -155,16 +205,20 @@ fi
 if grep -qE "^MIGRATRIX_JWT_KEY=" "$ENV_FILE"; then
   tmp="$(mktemp)"; grep -vE "^MIGRATRIX_JWT_KEY=" "$ENV_FILE" > "$tmp"; mv "$tmp" "$ENV_FILE"
 fi
-echo "Updated $ENV_FILE (MIGRATRIX_MODE=$MODE${HOST:+, AGENT_HOST=$HOST})"
+chmod 600 "$ENV_FILE"
+echo "Updated $ENV_FILE (MIGRATRIX_MODE=$MODE${HOST:+, AGENT_HOST=$HOST}; readable by its owner only)"
 
 # --- registry login (only with a real token) ------------------------------
 # The registry the compose file pulls from (REGISTRY in .env, e.g. ghcr.io/migratrix/).
 REGISTRY_PREFIX="$(grep -E '^REGISTRY=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
 REGISTRY_HOST="${REGISTRY_PREFIX%%/*}"
 [ -n "$REGISTRY_HOST" ] || REGISTRY_HOST="ghcr.io"
-case "$GITHUB_TOKEN" in
-  *xxxx*|"<"*">") echo "error: --github-token is a placeholder; leave it out to pull anonymously, or pass the token Migratrix gave you" >&2; exit 1 ;;
-esac
+# A login to the registry that Docker already holds on this machine (docker login done earlier).
+STORED_LOGIN=0
+DOCKER_CONFIG_FILE="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+if [ -f "$DOCKER_CONFIG_FILE" ] && grep -q "\"$REGISTRY_HOST\"" "$DOCKER_CONFIG_FILE" 2>/dev/null; then
+  STORED_LOGIN=1
+fi
 if [ -n "$GITHUB_TOKEN" ]; then
   command -v docker >/dev/null 2>&1 || { echo "error: --github-token given but docker is not installed" >&2; exit 1; }
   if printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY_HOST" -u "$GITHUB_USER" --password-stdin >/dev/null; then
@@ -174,6 +228,8 @@ if [ -n "$GITHUB_TOKEN" ]; then
     echo "       Run the installer again with a valid token, or without --github-token to pull anonymously." >&2
     exit 1
   fi
+elif [ "$STORED_LOGIN" = "1" ]; then
+  echo "No --github-token: the images are pulled with the $REGISTRY_HOST login already stored on this machine"
 else
   echo "No --github-token: not logging in to $REGISTRY_HOST; the images are pulled anonymously"
 fi
@@ -185,7 +241,10 @@ if [ "$PULL" = "1" ]; then
   elif ! (cd "$REPO_ROOT" && docker compose pull); then
     echo "" >&2
     echo "error: could not pull the Migratrix images from ${REGISTRY_PREFIX:-$REGISTRY_HOST}." >&2
-    if [ -z "$GITHUB_TOKEN" ]; then
+    if [ -z "$GITHUB_TOKEN" ] && [ "$STORED_LOGIN" = "1" ]; then
+      echo "       The registry refused the $REGISTRY_HOST login stored on this machine, or the images do not exist there." >&2
+      echo "       If Migratrix gave you a registry token, run the installer again with --github-token <token>." >&2
+    elif [ -z "$GITHUB_TOKEN" ]; then
       echo "       The registry refused anonymous access. If Migratrix gave you a registry token, run the installer" >&2
       echo "       again with --github-token <token>; otherwise contact Migratrix support." >&2
     else
@@ -203,7 +262,18 @@ cat <<EOF
    docker compose up -d
 EOF
 case "$MODE" in
-  localhost) echo "   Agent will be reachable at: https://$HOST" ;;
-  custom|ip) echo "   Reachable at: https://$HOST once the agent connects and its certificate is applied." ;;
+  localhost) echo "   Agent will be reachable at: https://$HOST - from a browser on this machine only."
+             if is_headless; then
+               echo "   This machine has no desktop: for a browser on another machine, run the installer again with"
+               echo "   --mode managed, --mode custom --host <your domain> or --mode ip --host <address>."
+             fi ;;
+  custom|ip) echo "   Reachable at: https://$HOST once the agent connects and its certificate is applied."
+             echo "   The HTTPS port (HTTPS_PORT in .env, 443 by default) must be open to the browsers that use the Platform." ;;
   managed)   echo "   Migratrix will assign a subdomain + certificate after the agent connects." ;;
 esac
+cat <<EOF
+
+   Then check that the agent connected - a wrong key or an unreachable orchestrator is said there, in words:
+   docker compose logs -f agent
+   and on the Platform: Settings → Agents shows the agent as Connected.
+EOF
