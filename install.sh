@@ -3,14 +3,16 @@
 # Migratrix bootstrap (macOS / Linux).
 #
 # This is the PUBLIC one-liner entrypoint. It downloads the compose file, the
-# .env template and the real installer into a working directory, then hands off
-# to the installer. The installer pulls the container images (ghcr.io): anonymously,
+# .env template, the released image versions and the real installer into a working
+# directory, then hands off to the installer. The installer pulls the container images (ghcr.io): anonymously,
 # or with --github-token when Migratrix gave you a registry token.
 #
 # Usage:
 #   curl -fsSL https://get.migratrix.com/install.sh | bash -s -- --api-key <key from Settings → Agents>
 #   curl -fsSL https://get.migratrix.com/install.sh | bash -s -- --mode custom --host agent.acme.com
 #       (without --api-key the installer asks for the key and does not echo it)
+#   curl -fsSL https://get.migratrix.com/install.sh | bash -s -- --upgrade
+#       (an installed agent: moves it to the released versions, keeps its key and settings)
 #
 # The files it downloads are checked against SHA256SUMS from the same place: a truncated or mixed-up download
 # stops the install. (Same origin, so this is an integrity check of the transfer, not a signature.)
@@ -37,6 +39,7 @@ fetch() { curl -fsSL "$BASE/$1" -o "$2" && echo "  fetched $1"; }
 
 fetch docker-compose.yml   docker-compose.yml
 fetch .env.example         .env.example
+fetch versions.env         versions.env
 fetch migratrix-install.sh scripts/migratrix-install.sh
 chmod +x scripts/migratrix-install.sh
 
@@ -66,6 +69,7 @@ verify() { # verify <published name> <local path>
 }
 verify docker-compose.yml   docker-compose.yml
 verify .env.example         .env.example
+verify versions.env         versions.env
 verify migratrix-install.sh scripts/migratrix-install.sh
 echo "  checksums ok"
 trap - EXIT

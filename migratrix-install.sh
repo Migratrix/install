@@ -18,6 +18,12 @@
 # Usage:
 #   migratrix-install.sh [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url <URL>] \
 #                        [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
+#   migratrix-install.sh --upgrade [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
+#
+# Image versions: the installer writes the released image tags (versions.env, downloaded and checked by the
+# bootstrap) into .env. They are fixed tags - nothing here follows "latest" - so the machine stays on them until
+# the installer is run again with --upgrade, which keeps the key, the mode and the host of the install, writes
+# the newly released tags, pulls them and restarts the containers.
 #
 # The agent key: --api-key, or the MIGRATRIX_API_KEY environment variable, or - with neither - the installer asks
 # for it without echoing it (nothing in the shell history or the process list).
@@ -37,10 +43,12 @@ ORCHESTRATOR_URL=""
 GITHUB_TOKEN=""
 GITHUB_USER="migratrix-bot"
 PULL=1
+UPGRADE=0
 
 usage() {
   cat >&2 <<EOF
 Usage: $0 [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url <URL>] [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
+       $0 --upgrade [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
 
   --api-key       Migratrix agent API key, from Settings → Agents in the Platform. Without it the installer
                   reads MIGRATRIX_API_KEY from the environment, or asks for the key without echoing it.
@@ -56,6 +64,8 @@ Usage: $0 [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url 
   --github-token  Registry read token for ghcr.io, when Migratrix gave you one (omit to pull anonymously)
   --github-user   User for the ghcr.io login (default: migratrix-bot)
   --no-pull       Do not pull the images now (local builds, or Docker not running yet)
+  --upgrade       Move an installed agent to the released image versions: keeps its key, mode and host,
+                  writes the new versions into .env, pulls them and restarts the containers
 EOF
   exit 1
 }
@@ -69,10 +79,58 @@ while [ $# -gt 0 ]; do
     --github-token) GITHUB_TOKEN="${2:-}"; shift 2 ;;
     --github-user)  GITHUB_USER="${2:-}"; shift 2 ;;
     --no-pull)      PULL=0; shift ;;
+    --upgrade)      UPGRADE=1; shift ;;
     -h|--help) usage ;;
     *) echo "error: unknown argument: $1" >&2; usage ;;
   esac
 done
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CERTS_DIR="$REPO_ROOT/certs"
+DYNAMIC_DIR="$REPO_ROOT/traefik/dynamic"
+TLS_FILE="$DYNAMIC_DIR/tls.yml"
+ENV_FILE="$REPO_ROOT/.env"
+VERSIONS_FILE="$REPO_ROOT/versions.env"
+
+# The last value of a key in a KEY=value file; empty when the file or the key is not there.
+value_of() { # value_of <file> <key>
+  [ -f "$1" ] || return 0
+  grep -E "^$2=" "$1" | tail -n1 | cut -d= -f2- | tr -d '\r' || true
+}
+
+# --- the released image versions --------------------------------------------
+# Read before anything is written: a set that is missing or not made of fixed tags stops the install.
+IMAGE_KEYS="AGENT_TAG RISK_TAG SQLGLOT_TAG JAVA_ANALYZER_TAG PYTHON_ANALYZER_TAG"
+if [ ! -f "$VERSIONS_FILE" ]; then
+  echo "error: $VERSIONS_FILE (the released image versions) is missing. Run the install command again:" >&2
+  echo "       curl -fsSL https://get.migratrix.com/install.sh | bash -s -- ..." >&2
+  exit 1
+fi
+for key in $IMAGE_KEYS; do
+  value="$(value_of "$VERSIONS_FILE" "$key")"
+  # A version X.Y.Z, or the commit an image was built from. Never a tag that moves.
+  if ! printf '%s' "$value" | grep -Eq '^(v?[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})$'; then
+    echo "error: $key in $VERSIONS_FILE is '${value}', not a released version. Run the install command again;" >&2
+    echo "       if it repeats, contact Migratrix support. Nothing was installed." >&2
+    exit 1
+  fi
+done
+
+# --- upgrade: the settings of the install that is already here -----------------
+if [ "$UPGRADE" = "1" ]; then
+  if [ -n "$MODE$HOST$API_KEY$ORCHESTRATOR_URL" ]; then
+    echo "error: --upgrade keeps the settings of the install; leave out --mode, --host, --api-key and --orchestrator-url" >&2
+    exit 1
+  fi
+  API_KEY="$(value_of "$ENV_FILE" MIGRATRIX_API_KEY)"
+  MODE="$(value_of "$ENV_FILE" MIGRATRIX_MODE)"
+  HOST="$(value_of "$ENV_FILE" AGENT_HOST)"
+  if [ -z "$API_KEY" ] || [ -z "$MODE" ]; then
+    echo "error: there is no installed agent in $REPO_ROOT to upgrade (no .env with a key and a mode)." >&2
+    echo "       Run the installer without --upgrade to install one." >&2
+    exit 1
+  fi
+fi
 
 # A Linux machine without a graphical session: nobody will open a browser on it, so https://agent.localhost and a
 # certificate trusted only by this machine are of no use (onboarding trials AGI-03).
@@ -104,7 +162,7 @@ case "$MODE" in
 esac
 
 # The agent key: the option, the environment, or a prompt that does not echo.
-[ -n "$API_KEY" ] || API_KEY="${MIGRATRIX_API_KEY:-}"
+[ -n "$API_KEY" ] || [ "$UPGRADE" = "1" ] || API_KEY="${MIGRATRIX_API_KEY:-}"
 [ -n "$GITHUB_TOKEN" ] || GITHUB_TOKEN="${MIGRATRIX_GITHUB_TOKEN:-}"
 if [ -z "$API_KEY" ] && ( : > /dev/tty ) 2>/dev/null; then
   printf 'Migratrix agent API key (Settings → Agents in the Platform; input is hidden): ' > /dev/tty
@@ -121,11 +179,6 @@ case "$GITHUB_TOKEN" in
   *xxxx*|"<"*">") echo "error: --github-token is a placeholder; leave it out to pull anonymously, or pass the token Migratrix gave you" >&2; exit 1 ;;
 esac
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CERTS_DIR="$REPO_ROOT/certs"
-DYNAMIC_DIR="$REPO_ROOT/traefik/dynamic"
-TLS_FILE="$DYNAMIC_DIR/tls.yml"
-ENV_FILE="$REPO_ROOT/.env"
 mkdir -p "$CERTS_DIR" "$DYNAMIC_DIR"
 
 # Point Traefik's file provider at /certs/<basename> (+ matching -key.pem).
@@ -156,7 +209,9 @@ ensure_mkcert() {
 }
 
 # --- TLS bootstrap (mode-specific) -----------------------------------------
-if [ "$MODE" = "localhost" ]; then
+if [ "$UPGRADE" = "1" ]; then
+  echo "Upgrade: the certificate and the settings of the install (mode: $MODE) are kept."
+elif [ "$MODE" = "localhost" ]; then
   ensure_mkcert
   mkcert -install
   # The real cert. Written as agent.crt/agent.key so the agent adopts it.
@@ -205,8 +260,26 @@ fi
 if grep -qE "^MIGRATRIX_JWT_KEY=" "$ENV_FILE"; then
   tmp="$(mktemp)"; grep -vE "^MIGRATRIX_JWT_KEY=" "$ENV_FILE" > "$tmp"; mv "$tmp" "$ENV_FILE"
 fi
+# The released image versions. What ran before is kept for the summary of an upgrade.
+VERSION_SUMMARY=""
+VERSIONS_CHANGED=0
+for key in $IMAGE_KEYS; do
+  new="$(value_of "$VERSIONS_FILE" "$key")"
+  old="$(value_of "$ENV_FILE" "$key")"
+  if [ "$old" = "$new" ]; then
+    VERSION_SUMMARY="$VERSION_SUMMARY   $key=$new (unchanged)
+"
+  else
+    VERSIONS_CHANGED=1
+    VERSION_SUMMARY="$VERSION_SUMMARY   $key=$new${old:+ (was $old)}
+"
+    set_env "$key" "$new"
+  fi
+done
 chmod 600 "$ENV_FILE"
 echo "Updated $ENV_FILE (MIGRATRIX_MODE=$MODE${HOST:+, AGENT_HOST=$HOST}; readable by its owner only)"
+echo "Image versions:"
+printf '%s' "$VERSION_SUMMARY"
 
 # --- registry login (only with a real token) ------------------------------
 # The registry the compose file pulls from (REGISTRY in .env, e.g. ghcr.io/migratrix/).
@@ -237,6 +310,12 @@ fi
 # --- pull the images ---------------------------------------------------------
 if [ "$PULL" = "1" ]; then
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    if [ "$UPGRADE" = "1" ]; then
+      echo "error: Docker is not installed or not running, so the new images were not pulled and the containers" >&2
+      echo "       still run the versions they had. .env already names the new versions: start Docker and run" >&2
+      echo "       docker compose pull && docker compose up -d   in $REPO_ROOT" >&2
+      exit 1
+    fi
     echo "Docker is not installed or not running: the images are pulled when you run docker compose up -d"
   elif ! (cd "$REPO_ROOT" && docker compose pull); then
     echo "" >&2
@@ -252,6 +331,30 @@ if [ "$PULL" = "1" ]; then
     fi
     exit 1
   fi
+fi
+
+# --- upgrade: restart on the new images ---------------------------------------
+if [ "$UPGRADE" = "1" ]; then
+  if [ "$PULL" = "0" ]; then
+    echo ""
+    echo "✅ .env names the released versions (--no-pull: nothing was pulled or restarted). To move the containers to them:"
+    echo "   cd \"$REPO_ROOT\""
+    echo "   docker compose pull && docker compose up -d"
+    exit 0
+  fi
+  if ! (cd "$REPO_ROOT" && docker compose up -d --remove-orphans); then
+    echo "error: the new images were pulled but the containers could not be restarted; see the message above." >&2
+    echo "       Run   docker compose up -d   in $REPO_ROOT   once it is solved." >&2
+    exit 1
+  fi
+  echo ""
+  if [ "$VERSIONS_CHANGED" = "1" ]; then
+    echo "✅ Upgraded. The agent restarts and reconnects by itself; Settings → Agents on the Platform shows its version."
+  else
+    echo "✅ Already on the released versions; nothing to upgrade."
+  fi
+  echo "   docker compose logs -f agent   shows the agent starting."
+  exit 0
 fi
 
 # --- next steps ------------------------------------------------------------
@@ -276,4 +379,7 @@ cat <<EOF
    Then check that the agent connected - a wrong key or an unreachable orchestrator is said there, in words:
    docker compose logs -f agent
    and on the Platform: Settings → Agents shows the agent as Connected.
+
+   The agent stays on the versions installed now. To move it to a newer release, run the install command again
+   with --upgrade in place of its other options.
 EOF

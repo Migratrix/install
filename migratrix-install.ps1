@@ -23,9 +23,15 @@
   The agent key: -ApiKey, or the MIGRATRIX_API_KEY environment variable, or - with neither - the installer asks
   for it without echoing it.
 
+  Image versions: the installer writes the released image tags (versions.env, downloaded and checked by the
+  bootstrap) into .env. They are fixed tags - nothing here follows "latest" - so the machine stays on them until
+  the installer is run again with -Upgrade, which keeps the key, the mode and the host of the install, writes
+  the newly released tags, pulls them and restarts the containers. -Upgrade needs no Administrator rights.
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File migratrix-install.ps1
   powershell -ExecutionPolicy Bypass -File migratrix-install.ps1 -Mode custom -HostName agent.acme.com
+  powershell -ExecutionPolicy Bypass -File migratrix-install.ps1 -Upgrade
 #>
 [CmdletBinding()]
 param(
@@ -43,6 +49,8 @@ param(
     [switch]$NoPull,
     # Do not add the Windows Firewall rule for the HTTPS port (modes managed / custom / ip).
     [switch]$NoFirewall,
+    # An installed agent: write the released image versions, pull them and restart; key, mode and host are kept.
+    [switch]$Upgrade,
     # Internal (the elevated run): where the first run left the key and token, where to write the output, and
     # who started the install.
     [string]$SecretsFile = "",
@@ -60,7 +68,49 @@ function Protect-File([string]$Path, [string]$User) {
     if ($LASTEXITCODE -ne 0) { Write-Warning "Could not restrict access to $Path (icacls exit $LASTEXITCODE)" }
 }
 
+# The last value of a key in a KEY=value file; empty when the file or the key is not there.
+function Get-FileValue([string]$Path, [string]$Key) {
+    if (-not (Test-Path $Path)) { return "" }
+    $line = Get-Content $Path | Where-Object { $_ -match "^$Key=" } | Select-Object -Last 1
+    if ($null -eq $line) { return "" }
+    return ([string]$line -replace "^$Key=", '').Trim()
+}
+
 function Install-Migratrix {
+    $RepoRoot     = Split-Path $PSScriptRoot -Parent
+    $EnvFile      = Join-Path $RepoRoot '.env'
+    $VersionsFile = Join-Path $RepoRoot 'versions.env'
+
+    # --- the released image versions -------------------------------------------
+    # Read before anything is written: a set that is missing or not made of fixed tags stops the install.
+    $imageKeys = @('AGENT_TAG', 'RISK_TAG', 'SQLGLOT_TAG', 'JAVA_ANALYZER_TAG', 'PYTHON_ANALYZER_TAG')
+    if (-not (Test-Path $VersionsFile)) {
+        throw "$VersionsFile (the released image versions) is missing. Run the install command again: & ([scriptblock]::Create((irm https://get.migratrix.com/install.ps1))) ..."
+    }
+    $released = @{}
+    foreach ($key in $imageKeys) {
+        $value = Get-FileValue $VersionsFile $key
+        # A version X.Y.Z, or the commit an image was built from. Never a tag that moves.
+        if ($value -cnotmatch '^(v?[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})$') {
+            throw "$key in $VersionsFile is '$value', not a released version. Run the install command again; if it repeats, contact Migratrix support. Nothing was installed."
+        }
+        $released[$key] = $value
+    }
+
+    # --- upgrade: the settings of the install that is already here ---------------
+    if ($Upgrade) {
+        if ($Mode -or $HostName -or $ApiKey -or $OrchestratorUrl) {
+            throw "-Upgrade keeps the settings of the install; leave out -Mode, -HostName, -ApiKey and -OrchestratorUrl"
+        }
+        $script:ApiKey   = Get-FileValue $EnvFile 'MIGRATRIX_API_KEY'
+        $savedMode       = Get-FileValue $EnvFile 'MIGRATRIX_MODE'
+        $script:HostName = Get-FileValue $EnvFile 'AGENT_HOST'
+        if (-not $ApiKey -or $savedMode -notin @('localhost', 'managed', 'custom', 'ip')) {
+            throw "There is no installed agent in $RepoRoot to upgrade (no .env with a key and a mode). Run the installer without -Upgrade to install one."
+        }
+        $script:Mode = $savedMode
+    }
+
     # --- secrets handed over by the non-elevated run ---------------------------
     if ($SecretsFile) {
         if (-not (Test-Path $SecretsFile)) { throw "The installer's hand-over file is missing; run the installer again." }
@@ -115,21 +165,22 @@ This is Windows Server: the default mode (localhost) would give an agent that on
     # --- self-elevate (hosts file, machine trust store and firewall need admin) --
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
+    # An upgrade touches none of them: it writes .env, pulls and restarts, as the user who installed.
+    if (-not $isAdmin -and -not $Upgrade) {
         $script:InstallExit = Invoke-Elevated $identity.Name
         return
     }
     if (-not $InstallUser) { $script:InstallUser = $identity.Name }
 
-    $RepoRoot   = Split-Path $PSScriptRoot -Parent
     $CertsDir   = Join-Path $RepoRoot 'certs'
     $DynamicDir = Join-Path $RepoRoot 'traefik\dynamic'
     $TlsFile    = Join-Path $DynamicDir 'tls.yml'
-    $EnvFile    = Join-Path $RepoRoot '.env'
     New-Item -ItemType Directory -Force -Path $CertsDir, $DynamicDir | Out-Null
 
     # --- TLS bootstrap (mode-specific) -----------------------------------------
-    if ($Mode -eq "localhost") {
+    if ($Upgrade) {
+        Write-Host "Upgrade: the certificate and the settings of the install (mode: $Mode) are kept."
+    } elseif ($Mode -eq "localhost") {
         if (-not (Get-Command mkcert -ErrorAction SilentlyContinue)) {
             Write-Host "mkcert not found - attempting to install..."
             if (Get-Command choco -ErrorAction SilentlyContinue) {
@@ -203,13 +254,32 @@ tls:
         Set-EnvVar 'MIGRATRIX_GITHUB_WEBHOOK_SECRET' (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
         Write-Host "Generated MIGRATRIX_GITHUB_WEBHOOK_SECRET in $EnvFile (use it as the GitHub webhook secret)"
     }
+    # The released image versions. What ran before is kept for the summary of an upgrade.
+    $versionsChanged = $false
+    $versionLines = @()
+    foreach ($key in $imageKeys) {
+        $new = $released[$key]
+        $old = Get-FileValue $EnvFile $key
+        if ($old -eq $new) {
+            $versionLines += "   $key=$new (unchanged)"
+        } else {
+            $versionsChanged = $true
+            $was = if ($old) { " (was $old)" } else { "" }
+            $versionLines += "   $key=$new$was"
+            Set-EnvVar $key $new
+        }
+    }
     Write-Host "Updated $EnvFile (MIGRATRIX_MODE=$Mode; readable by $InstallUser and Administrators only)"
+    Write-Host "Image versions:"
+    $versionLines | ForEach-Object { Write-Host $_ }
 
     # --- Windows Firewall: the HTTPS port, for a browser on another machine ------
     $HttpsPort = (Get-Content $EnvFile | Where-Object { $_ -match '^HTTPS_PORT=\d+' } | Select-Object -Last 1) -replace '^HTTPS_PORT=', ''
     if (-not $HttpsPort) { $HttpsPort = '443' }
     $firewallNote = ""
-    if ($Mode -ne "localhost" -and -not $NoFirewall) {
+    if ($Upgrade) {
+        # The rule of the install is kept as it is.
+    } elseif ($Mode -ne "localhost" -and -not $NoFirewall) {
         $ruleName = "Migratrix Agent (HTTPS $HttpsPort)"
         try {
             if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
@@ -258,6 +328,9 @@ tls:
             cmd /c "docker info >nul 2>&1"
             $dockerUp = ($LASTEXITCODE -eq 0)
         }
+        if (-not $dockerUp -and $Upgrade) {
+            throw "Docker is not installed or not running, so the new images were not pulled and the containers still run the versions they had. .env already names the new versions: start Docker and run 'docker compose pull' and 'docker compose up -d' in $RepoRoot."
+        }
         if (-not $dockerUp) {
             Write-Host "Docker is not installed or not running: the images are pulled when you run docker compose up -d"
         } else {
@@ -276,6 +349,32 @@ tls:
         }
     }
 
+    # --- upgrade: restart on the new images ---------------------------------------
+    if ($Upgrade) {
+        Write-Host ""
+        if ($NoPull) {
+            Write-Host ".env names the released versions (-NoPull: nothing was pulled or restarted). To move the containers to them:" -ForegroundColor Green
+            Write-Host "   cd `"$RepoRoot`""
+            Write-Host "   docker compose pull"
+            Write-Host "   docker compose up -d"
+            $script:InstallExit = 0
+            return
+        }
+        Push-Location $RepoRoot
+        try { docker compose up -d --remove-orphans } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) {
+            throw "The new images were pulled but the containers could not be restarted; see the message above. Run 'docker compose up -d' in $RepoRoot once it is solved."
+        }
+        if ($versionsChanged) {
+            Write-Host "Upgraded. The agent restarts and reconnects by itself; Settings > Agents on the Platform shows its version." -ForegroundColor Green
+        } else {
+            Write-Host "Already on the released versions; nothing to upgrade." -ForegroundColor Green
+        }
+        Write-Host "   docker compose logs -f agent   shows the agent starting."
+        $script:InstallExit = 0
+        return
+    }
+
     Write-Host ""
     Write-Host "Done (mode: $Mode). Start the agent:" -ForegroundColor Green
     Write-Host "   cd `"$RepoRoot`""
@@ -291,6 +390,9 @@ tls:
     Write-Host "   Then check that the agent connected - a wrong key or an unreachable orchestrator is said there, in words:"
     Write-Host "   docker compose logs -f agent"
     Write-Host "   and on the Platform: Settings > Agents shows the agent as Connected."
+    Write-Host ""
+    Write-Host "   The agent stays on the versions installed now. To move it to a newer release, run the install command"
+    Write-Host "   again with -Upgrade in place of its other options."
     $script:InstallExit = 0
 }
 

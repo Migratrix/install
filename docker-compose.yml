@@ -1,3 +1,6 @@
+# Image versions: every Migratrix image is pulled by a fixed tag from .env (AGENT_TAG, RISK_TAG, SQLGLOT_TAG,
+# JAVA_ANALYZER_TAG, PYTHON_ANALYZER_TAG). The installer writes them from the released set (versions.env); there
+# is no default and no "latest", so a machine never moves to another version on its own (onboarding trials D-08).
 services:
 
   traefik:
@@ -26,7 +29,7 @@ services:
       - risk-assessment
 
   agent:
-    image: ${REGISTRY:-}migratrix-agent:${TAG:-latest}
+    image: ${REGISTRY:-}migratrix-agent:${AGENT_TAG:?AGENT_TAG is not set in .env - run the installer, it writes the released image versions}
     container_name: migratrix-agent
     restart: unless-stopped
     # Replica workers finish the batch in hand, save the checkpoint and release their lease on a stop
@@ -45,6 +48,9 @@ services:
       TRAEFIK_DYNAMIC_DIR: /etc/traefik/dynamic
       AGENT_HOST: "${AGENT_HOST:-agent.localhost}"
       MIGRATRIX_MODE: "${MIGRATRIX_MODE:-localhost}"
+      # The port the proxy publishes for the agent: with AGENT_HOST it is the address the agent tells the
+      # Platform it is reached at (https://<AGENT_HOST>[:port]).
+      AGENT_HTTPS_PORT: "${HTTPS_PORT:-443}"
       SqlGlot__BaseUrl: "http://sqlglot:5123"
       SqlGlot__Enabled: "true"
       # The Data MCP for AI assistants, at https://<AGENT_HOST>/mcp. TLS ends at Traefik, so the public name tokens
@@ -72,7 +78,7 @@ services:
       - "traefik.http.services.agent.loadbalancer.server.scheme=http"
 
   risk-assessment:
-    image: ${REGISTRY:-}migratrix-risk-assessment:${TAG:-latest}
+    image: ${REGISTRY:-}migratrix-risk-assessment:${RISK_TAG:?RISK_TAG is not set in .env - run the installer, it writes the released image versions}
     container_name: migratrix-risk-assessment
     restart: unless-stopped
     environment:
@@ -106,17 +112,17 @@ services:
       - "traefik.http.services.risk.loadbalancer.server.scheme=http"
 
   java-analyzer:
-    image: ${REGISTRY:-}migratrix-java-analyzer:${TAG:-latest}
+    image: ${REGISTRY:-}migratrix-java-analyzer:${JAVA_ANALYZER_TAG:?JAVA_ANALYZER_TAG is not set in .env - run the installer, it writes the released image versions}
     container_name: migratrix-java-analyzer
     restart: unless-stopped
 
   python-analyzer:
-    image: ${REGISTRY:-}migratrix-python-analyzer:${TAG:-latest}
+    image: ${REGISTRY:-}migratrix-python-analyzer:${PYTHON_ANALYZER_TAG:?PYTHON_ANALYZER_TAG is not set in .env - run the installer, it writes the released image versions}
     container_name: migratrix-python-analyzer
     restart: unless-stopped
 
   sqlglot:
-    image: ${REGISTRY:-}migratrix-sqlglot-parser:${TAG:-latest}
+    image: ${REGISTRY:-}migratrix-sqlglot-parser:${SQLGLOT_TAG:?SQLGLOT_TAG is not set in .env - run the installer, it writes the released image versions}
     container_name: migratrix-sqlglot
     restart: unless-stopped
 

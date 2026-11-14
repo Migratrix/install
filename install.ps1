@@ -4,8 +4,8 @@
   Migratrix bootstrap (Windows) — PUBLIC one-liner entrypoint.
 
 .DESCRIPTION
-  Downloads the compose file, the .env template and the real installer into a
-  working directory, then hands off to the installer. The installer pulls the
+  Downloads the compose file, the .env template, the released image versions and
+  the real installer into a working directory, then hands off to the installer. The installer pulls the
   container images (ghcr.io): anonymously, or with -GithubToken when Migratrix gave
   you a registry token.
 
@@ -14,6 +14,8 @@
   & ([scriptblock]::Create((irm https://get.migratrix.com/install.ps1))) -ApiKey <key from Settings - Agents>
   & ([scriptblock]::Create((irm https://get.migratrix.com/install.ps1))) -Mode custom -HostName agent.acme.com
   # Without -ApiKey the installer asks for the key and does not echo it.
+  # An installed agent: move it to the released versions, keeping its key and settings.
+  & ([scriptblock]::Create((irm https://get.migratrix.com/install.ps1))) -Upgrade
 
 .NOTES
   Overridable via env: MIGRATRIX_BASE_URL, MIGRATRIX_DIR
@@ -32,7 +34,9 @@ param(
     [string]$GithubToken = "",
     [string]$GithubUser = "migratrix-bot",
     [switch]$NoPull,
-    [switch]$NoFirewall
+    [switch]$NoFirewall,
+    # An installed agent: write the released image versions, pull them and restart; key, mode and host are kept.
+    [switch]$Upgrade
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +57,7 @@ function Fetch($name, $dest) {
 }
 Fetch 'docker-compose.yml'    'docker-compose.yml'
 Fetch '.env.example'          '.env.example'
+Fetch 'versions.env'          'versions.env'
 Fetch 'migratrix-install.ps1' 'scripts\migratrix-install.ps1'
 
 # --- integrity: every fetched file must match the published checksum ----------
@@ -76,6 +81,7 @@ function Verify($name, $path) {
 }
 Verify 'docker-compose.yml'    'docker-compose.yml'
 Verify '.env.example'          '.env.example'
+Verify 'versions.env'          'versions.env'
 Verify 'migratrix-install.ps1' 'scripts\migratrix-install.ps1'
 Write-Host "  checksums ok"
 
@@ -90,6 +96,7 @@ if ($HostName)        { $installArgs += @('-HostName', $HostName) }
 if ($OrchestratorUrl) { $installArgs += @('-OrchestratorUrl', $OrchestratorUrl) }
 if ($NoPull)          { $installArgs += '-NoPull' }
 if ($NoFirewall)      { $installArgs += '-NoFirewall' }
+if ($Upgrade)         { $installArgs += '-Upgrade' }
 $hadKey = $env:MIGRATRIX_API_KEY
 $hadToken = $env:MIGRATRIX_GITHUB_TOKEN
 try {
