@@ -28,6 +28,23 @@
   the installer is run again with -Upgrade, which keeps the key, the mode and the host of the install, writes
   the newly released tags, pulls them and restarts the containers. -Upgrade needs no Administrator rights.
 
+  Outgoing proxy: -Proxy, or HTTPS_PROXY / HTTP_PROXY / NO_PROXY of the environment the installer runs in, are
+  written to .env (MIGRATRIX_HTTPS_PROXY, MIGRATRIX_HTTP_PROXY, MIGRATRIX_NO_PROXY) and given to the containers
+  that call out (the agent and the Risk Assessment API). The names of the other containers are always added to
+  the no-proxy list. Image pulls are made by Docker, which has its own proxy setting. "-Proxy none" removes it.
+
+  A proxy that inspects TLS: -CaFile <PEM> (or MIGRATRIX_EXTRA_CA_FILE) adds the proxy's CA to what the agent
+  and the Risk Assessment API trust (certs\extra-ca.pem, joined with the image's own CA list in
+  certs\ca-bundle.pem). "-CaFile none" removes it.
+
+  A second agent on a key whose agent is connected is refused and keeps trying: stop the other agent, or run
+  the installer again with -Replace, or regenerate the key in Settings > Agents. -Replace makes this
+  installation take over from the one that is connected, once (MIGRATRIX_AGENT_REPLACE in .env).
+
+  Exit codes: 0 done; 1 an error (the message says which); 3 the files are prepared but Docker is not installed
+  or not running, so nothing was pulled or started (with -Upgrade: .env names the new versions and the containers
+  still run the old ones); 4 a port the agent publishes is already in use on this machine (nothing was written).
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File migratrix-install.ps1
   powershell -ExecutionPolicy Bypass -File migratrix-install.ps1 -Mode custom -HostName agent.acme.com
@@ -51,6 +68,18 @@ param(
     [switch]$NoFirewall,
     # An installed agent: write the released image versions, pull them and restart; key, mode and host are kept.
     [switch]$Upgrade,
+    # The outgoing proxy of the agent and the Risk Assessment API, e.g. http://proxy.example.com:3128. Left out:
+    # HTTPS_PROXY / HTTP_PROXY / NO_PROXY of the environment, or what .env already holds. "none" removes it.
+    [string]$Proxy = "",
+    # Hosts reached without the proxy, comma separated. The other Migratrix containers are always added.
+    [string]$NoProxy = "",
+    # A PEM file with the CA of a proxy that inspects TLS. Left out: MIGRATRIX_EXTRA_CA_FILE. "none" removes it.
+    [string]$CaFile = "",
+    # The host ports the agent's proxy publishes (HTTPS_PORT, 443 by default; AGENT_PORT, 4002 by default).
+    [ValidateRange(0, 65535)][int]$HttpsPort = 0,
+    [ValidateRange(0, 65535)][int]$AgentPort = 0,
+    # Take over, once, from another installation that is connected with the same key.
+    [switch]$Replace,
     # Internal (the elevated run): where the first run left the key and token, where to write the output, and
     # who started the install.
     [string]$SecretsFile = "",
@@ -59,6 +88,58 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:NoProxyGiven = $PSBoundParameters.ContainsKey('NoProxy')
+$script:ProxyResolved = $false
+$script:HttpsProxyValue = ""
+$script:HttpProxyValue = ""
+$script:NoProxyValue = ""
+# The exit code of a failure that is not the general 1 (4: a published port is in use).
+$script:FailExit = 0
+
+# A proxy URL without its user name and password, for messages.
+function Hide-Credentials([string]$Url) { return ($Url -replace '(://)[^/@]*@', '$1***@') }
+
+function Assert-ProxyUrl([string]$What, [string]$Value) {
+    if (-not $Value) { return }
+    if ($Value -notmatch '^https?://') { throw "$What must be a URL that starts with http:// or https:// (for example http://proxy.example.com:3128)" }
+    if ($Value -match '[\s$''"`]') { throw "$What holds a space, a quote or a `$ sign; write such characters of the user name or password percent-encoded (%24 for `$)" }
+}
+
+# Whether Docker answers. Through cmd: with $ErrorActionPreference = 'Stop', PowerShell 5 turns a redirected
+# stderr line of a native command into a terminating error.
+function Test-DockerUp {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $false }
+    cmd /c "docker info >nul 2>&1"
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Test-PortInUse([int]$Port) {
+    try {
+        if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+            return [bool](Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+        }
+    } catch { }
+    try {
+        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        return [bool]($listeners | Where-Object { $_.Port -eq $Port })
+    } catch { return $false }
+}
+
+# Best effort: who holds a port.
+function Get-PortHolder([int]$Port, [bool]$DockerUp) {
+    if ($DockerUp) {
+        $name = cmd /c "docker ps --filter publish=$Port --format {{.Names}} 2>nul" | Select-Object -First 1
+        if ($name) { return "the Docker container $name" }
+    }
+    try {
+        $conn = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($conn) {
+            $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+            if ($proc) { return "$($proc.ProcessName) (pid $($proc.Id))" }
+        }
+    } catch { }
+    return ""
+}
 
 # S-1-5-32-544 = Administrators, S-1-5-18 = SYSTEM (names differ per Windows language, the ids do not).
 function Protect-File([string]$Path, [string]$User) {
@@ -69,9 +150,22 @@ function Protect-File([string]$Path, [string]$User) {
 }
 
 # The last value of a key in a KEY=value file; empty when the file or the key is not there.
+# KEY=value files are read and written as UTF-8 without a byte-order mark: Windows PowerShell 5 reads with the
+# machine's code page by default and "-Encoding ascii" turned every non-ASCII character of .env.example's comments
+# into "?" (and a mark at the start of .env would become part of the first key for docker compose).
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+function Read-Lines([string]$Path) {
+    if (-not (Test-Path $Path)) { return @() }
+    return @([System.IO.File]::ReadAllLines((Resolve-Path -LiteralPath $Path).ProviderPath, $script:Utf8NoBom))
+}
+function Write-Lines([string]$Path, [string[]]$Lines) {
+    $full = if (Test-Path $Path) { (Resolve-Path -LiteralPath $Path).ProviderPath } else { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path) }
+    [System.IO.File]::WriteAllLines($full, [string[]]@($Lines), $script:Utf8NoBom)
+}
+
 function Get-FileValue([string]$Path, [string]$Key) {
     if (-not (Test-Path $Path)) { return "" }
-    $line = Get-Content $Path | Where-Object { $_ -match "^$Key=" } | Select-Object -Last 1
+    $line = Read-Lines $Path | Where-Object { $_ -match "^$Key=" } | Select-Object -Last 1
     if ($null -eq $line) { return "" }
     return ([string]$line -replace "^$Key=", '').Trim()
 }
@@ -118,6 +212,14 @@ function Install-Migratrix {
         Remove-Item -Force $SecretsFile
         if ($handed.ApiKey)      { $script:ApiKey = [string]$handed.ApiKey }
         if ($handed.GithubToken) { $script:GithubToken = [string]$handed.GithubToken }
+        # The proxy was worked out by the first run: the elevated one does not have its environment, and a proxy
+        # URL may hold a password, so it does not travel on the command line.
+        if ($handed.ProxyResolved) {
+            $script:ProxyResolved   = $true
+            $script:HttpsProxyValue = [string]$handed.HttpsProxy
+            $script:HttpProxyValue  = [string]$handed.HttpProxy
+            $script:NoProxyValue    = [string]$handed.NoProxy
+        }
     }
 
     # --- mode: no default on a server -----------------------------------------
@@ -160,6 +262,73 @@ This is Windows Server: the default mode (localhost) would give an agent that on
     }
     if ($GithubToken -match 'xxxx' -or $GithubToken -match '^<.*>$') {
         throw "-GithubToken is a placeholder; leave it out to pull anonymously, or pass the token Migratrix gave you"
+    }
+
+    # --- outgoing proxy ----------------------------------------------------------
+    # The option, then the environment the installer runs in, then what an earlier run wrote to .env.
+    if (-not $ProxyResolved) {
+        if ($Proxy -eq 'none') {
+            # no proxy: also drops what .env held
+        } elseif ($Proxy) {
+            $script:HttpsProxyValue = $Proxy; $script:HttpProxyValue = $Proxy
+        } else {
+            $script:HttpsProxyValue = [string]$env:HTTPS_PROXY
+            $script:HttpProxyValue  = [string]$env:HTTP_PROXY
+            if (-not $HttpsProxyValue -and -not $HttpProxyValue) {
+                $script:HttpsProxyValue = Get-FileValue $EnvFile 'MIGRATRIX_HTTPS_PROXY'
+                $script:HttpProxyValue  = Get-FileValue $EnvFile 'MIGRATRIX_HTTP_PROXY'
+            }
+        }
+        Assert-ProxyUrl "The HTTPS proxy" $HttpsProxyValue
+        Assert-ProxyUrl "The HTTP proxy" $HttpProxyValue
+        if ($HttpsProxyValue -or $HttpProxyValue) {
+            $list = if ($NoProxyGiven) { $NoProxy } elseif ($env:NO_PROXY) { [string]$env:NO_PROXY } else { Get-FileValue $EnvFile 'MIGRATRIX_NO_PROXY' }
+            $list = $list -replace '[\s$''"`]', ''
+            # The other containers are reached by name, never through the proxy.
+            $names = @()
+            foreach ($name in (@($list -split ',') + @('localhost', '127.0.0.1', 'risk-assessment', 'sqlglot', 'java-analyzer', 'python-analyzer', 'host.docker.internal'))) {
+                if ($name -and ($names -notcontains $name)) { $names += $name }
+            }
+            $script:NoProxyValue = $names -join ','
+        }
+        $script:ProxyResolved = $true
+    }
+
+    # --- extra CA (a proxy that inspects TLS) ------------------------------------
+    if (-not $CaFile -and $env:MIGRATRIX_EXTRA_CA_FILE) { $script:CaFile = $env:MIGRATRIX_EXTRA_CA_FILE }
+    if ($CaFile -and $CaFile -ne 'none') {
+        if (-not (Test-Path -PathType Leaf $CaFile)) { throw "-CaFile: $CaFile does not exist" }
+        $script:CaFile = (Resolve-Path $CaFile).Path
+        if (-not (Select-String -Path $CaFile -SimpleMatch '-----BEGIN CERTIFICATE-----' -Quiet)) {
+            throw "-CaFile: $CaFile is not a PEM certificate file (no '-----BEGIN CERTIFICATE-----' line). A .cer / .der file can be converted with: certutil -encode <file> ca.pem"
+        }
+    }
+
+    # --- the published ports must be free ----------------------------------------
+    # Checked before anything is written. A port held by this installation's own proxy container is fine.
+    $httpsPortValue = if ($HttpsPort) { "$HttpsPort" } else { Get-FileValue $EnvFile 'HTTPS_PORT' }
+    if ($httpsPortValue -notmatch '^\d+$') { $httpsPortValue = '443' }
+    $agentPortValue = if ($AgentPort) { "$AgentPort" } else { Get-FileValue $EnvFile 'AGENT_PORT' }
+    if ($agentPortValue -notmatch '^\d+$') { $agentPortValue = '4002' }
+    if ($httpsPortValue -eq $agentPortValue) { throw "HTTPS_PORT and AGENT_PORT are both $httpsPortValue; they must differ" }
+    $dockerUp = Test-DockerUp
+    $ownPorts = ""
+    if ($dockerUp) { $ownPorts = [string](cmd /c "docker ps --filter name=migratrix-traefik --format {{.Ports}} 2>nul") }
+    $taken = @()
+    foreach ($check in @(@('HTTPS_PORT', $httpsPortValue, '-HttpsPort'), @('AGENT_PORT', $agentPortValue, '-AgentPort'))) {
+        $key = $check[0]; $port = $check[1]; $option = $check[2]
+        if ($ownPorts -match (":" + $port + "->")) { continue }
+        if (Test-PortInUse ([int]$port)) {
+            $holder = Get-PortHolder ([int]$port) $dockerUp
+            $by = if ($holder) { " by $holder" } else { "" }
+            $line = "Port $port on this machine is already in use$by. The agent's proxy publishes it ($key). Free the port, or choose another one: run the installer again with $option <port> (it writes $key to $EnvFile)."
+            if ($key -eq 'HTTPS_PORT') { $line += " With another HTTPS port the agent's address carries it: https://<host>:<port>." }
+            $taken += $line
+        }
+    }
+    if ($taken.Count -gt 0) {
+        $script:FailExit = 4
+        throw (($taken -join " ") + " Nothing was installed or started.")
     }
 
     # --- self-elevate (hosts file, machine trust store and firewall need admin) --
@@ -211,6 +380,12 @@ tls:
   certificates:
     - certFile: /certs/live-bootstrap.pem
       keyFile: /certs/live-bootstrap-key.pem
+  # Also the default certificate: a client that connects by address sends no server name (N-R2A-1).
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/live-bootstrap.pem
+        keyFile: /certs/live-bootstrap-key.pem
 "@ | Set-Content -Path $TlsFile -Encoding ascii
         Write-Host "Generated mkcert certificate for $HostName; wrote $TlsFile"
 
@@ -239,11 +414,50 @@ tls:
     Protect-File $EnvFile $InstallUser
 
     function Set-EnvVar([string]$Key, [string]$Value) {
-        $lines = @(Get-Content $EnvFile | Where-Object { $_ -notmatch "^$Key=" })
+        $lines = @(Read-Lines $EnvFile | Where-Object { $_ -notmatch "^$Key=" })
         $lines += "$Key=$Value"
-        Set-Content -Path $EnvFile -Value $lines -Encoding ascii
+        Write-Lines $EnvFile $lines
+    }
+    function Remove-EnvVar([string]$Key) {
+        $lines = @(Read-Lines $EnvFile | Where-Object { $_ -notmatch "^$Key=" })
+        Write-Lines $EnvFile $lines
     }
     Set-EnvVar 'MIGRATRIX_MODE' $Mode
+    if ($HttpsPort) { Set-EnvVar 'HTTPS_PORT' "$HttpsPort" }
+    if ($AgentPort) { Set-EnvVar 'AGENT_PORT' "$AgentPort" }
+    # The outgoing proxy of the agent and the Risk Assessment API. Under their own names: docker compose prefers
+    # the shell's variables to .env, and a NO_PROXY of the shell would drop the container names added here.
+    $proxyNote = ""
+    if ($HttpsProxyValue -or $HttpProxyValue) {
+        if ($HttpsProxyValue) { Set-EnvVar 'MIGRATRIX_HTTPS_PROXY' $HttpsProxyValue } else { Remove-EnvVar 'MIGRATRIX_HTTPS_PROXY' }
+        if ($HttpProxyValue)  { Set-EnvVar 'MIGRATRIX_HTTP_PROXY' $HttpProxyValue }   else { Remove-EnvVar 'MIGRATRIX_HTTP_PROXY' }
+        Set-EnvVar 'MIGRATRIX_NO_PROXY' $NoProxyValue
+        $proxyNote = Hide-Credentials $(if ($HttpsProxyValue) { $HttpsProxyValue } else { $HttpProxyValue })
+        Write-Host "Outgoing proxy for the agent and the Risk Assessment API: $proxyNote"
+        Write-Host "   not through the proxy: $NoProxyValue"
+        Write-Host "   Image pulls are made by Docker, which does not read this: if the pull below cannot reach the registry,"
+        Write-Host "   give Docker the proxy (Docker Desktop: Settings > Resources > Proxies)."
+    } else {
+        Remove-EnvVar 'MIGRATRIX_HTTPS_PROXY'; Remove-EnvVar 'MIGRATRIX_HTTP_PROXY'; Remove-EnvVar 'MIGRATRIX_NO_PROXY'
+    }
+    # The extra CA: kept as certs\extra-ca.pem; the list the containers read is built after the images are here.
+    $ExtraCa  = Join-Path $CertsDir 'extra-ca.pem'
+    $CaBundle = Join-Path $CertsDir 'ca-bundle.pem'
+    if ($CaFile -eq 'none') {
+        Remove-Item -Force -ErrorAction SilentlyContinue $ExtraCa, $CaBundle
+        Remove-EnvVar 'MIGRATRIX_SSL_CERT_FILE'
+        Write-Host "Extra CA removed: the containers trust their own CA list only."
+    } elseif ($CaFile) {
+        if ($CaFile -ne $ExtraCa) { Copy-Item $CaFile $ExtraCa -Force }
+        Write-Host "Extra CA copied to $ExtraCa"
+    }
+    # Take over from another installation on the same key: only for the start that asked for it.
+    if ($Replace) {
+        Set-EnvVar 'MIGRATRIX_AGENT_REPLACE' ([string][DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+        Write-Host "-Replace: this agent takes over from the installation that is connected with the same key (once)."
+    } else {
+        Remove-EnvVar 'MIGRATRIX_AGENT_REPLACE'
+    }
     if ($HostName) { Set-EnvVar 'AGENT_HOST' $HostName }
     Set-EnvVar 'MIGRATRIX_API_KEY' $ApiKey
     if ($OrchestratorUrl) { Set-EnvVar 'MIGRATRIX_ORCHESTRATOR_URL' $OrchestratorUrl.TrimEnd('/') }
@@ -257,9 +471,14 @@ tls:
     # The released image versions. What ran before is kept for the summary of an upgrade.
     $versionsChanged = $false
     $versionLines = @()
+    # An install made by the installer of before fixed versions has one line for all five images, TAG=latest.
+    # Nothing reads it any more: it is removed, and the summary says what the images ran on ("was latest").
+    $legacyTag = Get-FileValue $EnvFile 'TAG'
+    if (Read-Lines $EnvFile | Where-Object { $_ -match '^TAG=' }) { Remove-EnvVar 'TAG' }
     foreach ($key in $imageKeys) {
         $new = $released[$key]
         $old = Get-FileValue $EnvFile $key
+        if (-not $old) { $old = $legacyTag }
         if ($old -eq $new) {
             $versionLines += "   $key=$new (unchanged)"
         } else {
@@ -274,7 +493,7 @@ tls:
     $versionLines | ForEach-Object { Write-Host $_ }
 
     # --- Windows Firewall: the HTTPS port, for a browser on another machine ------
-    $HttpsPort = (Get-Content $EnvFile | Where-Object { $_ -match '^HTTPS_PORT=\d+' } | Select-Object -Last 1) -replace '^HTTPS_PORT=', ''
+    $HttpsPort = (Read-Lines $EnvFile | Where-Object { $_ -match '^HTTPS_PORT=\d+' } | Select-Object -Last 1) -replace '^HTTPS_PORT=', ''
     if (-not $HttpsPort) { $HttpsPort = '443' }
     $firewallNote = ""
     if ($Upgrade) {
@@ -299,7 +518,7 @@ tls:
 
     # --- registry login (only with a real token) ------------------------------
     # The registry the compose file pulls from (REGISTRY in .env, e.g. ghcr.io/migratrix/).
-    $RegistryPrefix = (Get-Content $EnvFile | Where-Object { $_ -match '^REGISTRY=' } | Select-Object -Last 1) -replace '^REGISTRY=', ''
+    $RegistryPrefix = (Read-Lines $EnvFile | Where-Object { $_ -match '^REGISTRY=' } | Select-Object -Last 1) -replace '^REGISTRY=', ''
     $RegistryHost = if ($RegistryPrefix) { ($RegistryPrefix -split '/')[0] } else { 'ghcr.io' }
     # A login to the registry that Docker already holds on this machine (docker login done earlier).
     $dockerConfigDir = if ($env:DOCKER_CONFIG) { $env:DOCKER_CONFIG } else { Join-Path $env:USERPROFILE '.docker' }
@@ -320,19 +539,19 @@ tls:
     }
 
     # --- pull the images ---------------------------------------------------------
+    $dockerDown = $false
     if (-not $NoPull) {
-        $dockerUp = $false
-        if (Get-Command docker -ErrorAction SilentlyContinue) {
-            # Through cmd: with $ErrorActionPreference = 'Stop', PowerShell 5 turns a redirected stderr line of a
-            # native command into a terminating error, so a Docker that is not running ended the install here.
-            cmd /c "docker info >nul 2>&1"
-            $dockerUp = ($LASTEXITCODE -eq 0)
-        }
         if (-not $dockerUp -and $Upgrade) {
-            throw "Docker is not installed or not running, so the new images were not pulled and the containers still run the versions they had. .env already names the new versions: start Docker and run 'docker compose pull' and 'docker compose up -d' in $RepoRoot."
+            # Exit code 3, as for an install: prepared, not started (the table in the header).
+            Write-Host ""
+            Write-Host "Prepared, NOT upgraded: Docker is not installed or not running, so the new images were not pulled and the containers still run the versions they had." -ForegroundColor Yellow
+            Write-Host "   .env already names the new versions: start Docker and run 'docker compose pull' and 'docker compose up -d' in $RepoRoot."
+            $script:InstallExit = 3
+            return
         }
         if (-not $dockerUp) {
-            Write-Host "Docker is not installed or not running: the images are pulled when you run docker compose up -d"
+            $dockerDown = $true
+            Write-Host "Docker is not installed or not running: no image was pulled."
         } else {
             Push-Location $RepoRoot
             try { docker compose pull } finally { Pop-Location }
@@ -345,6 +564,45 @@ tls:
                     throw "Could not pull the Migratrix images from $what. The registry refused the $RegistryHost login stored on this machine, or the images do not exist there. If Migratrix gave you a registry token, run the installer again with -GithubToken <token>."
                 }
                 throw "Could not pull the Migratrix images from $what. The registry refused anonymous access. If Migratrix gave you a registry token, run the installer again with -GithubToken <token>; otherwise contact Migratrix support."
+            }
+        }
+    }
+
+    # --- extra CA: the list the containers read -------------------------------------
+    # SSL_CERT_FILE replaces the image's CA list, it does not add to it: the file given to the containers is the
+    # image's own list followed by the extra CA. Rebuilt on every run (a new image may carry a newer list).
+    $caNote = ""
+    if (Test-Path $ExtraCa) {
+        $agentImage = "${RegistryPrefix}migratrix-agent:" + (Get-FileValue $EnvFile 'AGENT_TAG')
+        $tmpBundle = Join-Path $env:TEMP ("migratrix-ca-" + [guid]::NewGuid().ToString('N') + ".pem")
+        $built = $false
+        if ($dockerUp) {
+            cmd /c "docker image inspect $agentImage >nul 2>&1"
+            if ($LASTEXITCODE -eq 0) {
+                # cmd writes the bytes as they are; PowerShell 5 would re-encode the redirected text.
+                cmd /c "docker run --rm --network none --entrypoint cat $agentImage /etc/ssl/certs/ca-certificates.crt > `"$tmpBundle`" 2>nul"
+                if ($LASTEXITCODE -eq 0 -and (Test-Path $tmpBundle) -and (Select-String -Path $tmpBundle -SimpleMatch '-----BEGIN CERTIFICATE-----' -Quiet)) {
+                    $out = [IO.File]::Create($CaBundle)
+                    try {
+                        foreach ($part in @($tmpBundle, $ExtraCa)) {
+                            $bytes = [IO.File]::ReadAllBytes($part)
+                            $out.Write($bytes, 0, $bytes.Length)
+                            $out.WriteByte(10)
+                        }
+                    } finally { $out.Dispose() }
+                    Set-EnvVar 'MIGRATRIX_SSL_CERT_FILE' '/certs/ca-bundle.pem'
+                    $built = $true
+                    Write-Host "Extra CA: the agent and the Risk Assessment API trust $ExtraCa in addition to their own CA list ($CaBundle)"
+                }
+            }
+        }
+        Remove-Item -Force -ErrorAction SilentlyContinue $tmpBundle
+        if (-not $built) {
+            if ((Test-Path $CaBundle) -and (Get-FileValue $EnvFile 'MIGRATRIX_SSL_CERT_FILE') -and -not $CaFile) {
+                Write-Host "Extra CA: the CA list built by an earlier run is kept ($CaBundle)"
+            } else {
+                $caNote = "The extra CA is saved ($ExtraCa) but NOT in use yet: the CA list is built from the agent image, which is not on this machine. Run the installer again, with Docker running and without -NoPull."
+                Write-Warning $caNote
             }
         }
     }
@@ -363,7 +621,10 @@ tls:
         Push-Location $RepoRoot
         try { docker compose up -d --remove-orphans } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) {
-            throw "The new images were pulled but the containers could not be restarted; see the message above. Run 'docker compose up -d' in $RepoRoot once it is solved."
+            Write-Host "Nothing was removed. The containers of this installation now:"
+            Push-Location $RepoRoot
+            try { cmd /c "docker compose ps --all 2>nul" | ForEach-Object { Write-Host "   $_" } } finally { Pop-Location }
+            throw "The new images were pulled but the containers could not be restarted; see the message above. Run 'docker compose up -d' in $RepoRoot once it is solved ('docker compose down' there stops the containers that are running)."
         }
         if ($versionsChanged) {
             Write-Host "Upgraded. The agent restarts and reconnects by itself; Settings > Agents on the Platform shows its version." -ForegroundColor Green
@@ -376,13 +637,37 @@ tls:
     }
 
     Write-Host ""
-    Write-Host "Done (mode: $Mode). Start the agent:" -ForegroundColor Green
+    if ($dockerDown) {
+        # Not the green "Done", and not exit 0: nothing was pulled and nothing runs (onboarding trials ERR-05).
+        Write-Host "Prepared, NOT started (mode: $Mode): Docker is not installed or not running on this machine." -ForegroundColor Yellow
+        Write-Host "   The settings are in $EnvFile, but no image was pulled and no container runs."
+        Write-Host "   Start Docker Desktop (or install it: https://docs.docker.com/get-docker/), then:"
+        Write-Host "   cd `"$RepoRoot`""
+        Write-Host "   docker compose pull"
+        Write-Host "   docker compose up -d"
+        if ($caNote) { Write-Host "   $caNote" }
+        if ($firewallNote) { Write-Host "   $firewallNote" }
+        Write-Host "   (To prepare the files on purpose without Docker, run the installer with -NoPull: it then ends with exit code 0.)"
+        $script:InstallExit = 3
+        return
+    }
+    if ($NoPull) {
+        Write-Host "Prepared (mode: $Mode; -NoPull: no image was pulled, nothing was started). Start the agent:" -ForegroundColor Green
+    } else {
+        Write-Host "Done (mode: $Mode). Start the agent:" -ForegroundColor Green
+    }
     Write-Host "   cd `"$RepoRoot`""
     Write-Host "   docker compose up -d"
     Write-Host ""
+    if ($caNote) { Write-Host "   WARNING: $caNote" }
+    if ($proxyNote) { Write-Host "   The agent reaches Migratrix through the proxy $proxyNote." }
+    if ($Replace) { Write-Host "   This start takes over from the agent that is connected with the same key; that one then stops serving." }
     switch ($Mode) {
         "localhost" { Write-Host "   Agent will be reachable at: https://$HostName - from a browser on this machine only." }
-        { $_ -in "custom", "ip" } { Write-Host "   Reachable at: https://$HostName once the agent applies its certificate." }
+        { $_ -in "custom", "ip" } {
+            $reach = if ($httpsPortValue -eq '443') { "https://$HostName" } else { "https://${HostName}:$httpsPortValue" }
+            Write-Host "   Reachable at: $reach once the agent applies its certificate."
+        }
         "managed" { Write-Host "   Migratrix will assign a subdomain + certificate after the agent connects." }
     }
     if ($firewallNote) { Write-Host "   $firewallNote" }
@@ -390,6 +675,8 @@ tls:
     Write-Host "   Then check that the agent connected - a wrong key or an unreachable orchestrator is said there, in words:"
     Write-Host "   docker compose logs -f agent"
     Write-Host "   and on the Platform: Settings > Agents shows the agent as Connected."
+    Write-Host "   If the log says another agent is connected with this key: stop that agent, or run the installer again"
+    Write-Host "   with -Replace, or regenerate the key in Settings > Agents."
     Write-Host ""
     Write-Host "   The agent stays on the versions installed now. To move it to a newer release, run the install command"
     Write-Host "   again with -Upgrade in place of its other options."
@@ -406,7 +693,8 @@ function Invoke-Elevated([string]$User) {
     $log = Join-Path $env:TEMP "migratrix-install-$id.log"
     New-Item -ItemType File -Path $secrets -Force | Out-Null
     Protect-File $secrets $User
-    @{ ApiKey = $ApiKey; GithubToken = $GithubToken } | ConvertTo-Json | Set-Content -Path $secrets -Encoding UTF8
+    @{ ApiKey = $ApiKey; GithubToken = $GithubToken; ProxyResolved = $true; HttpsProxy = $HttpsProxyValue
+       HttpProxy = $HttpProxyValue; NoProxy = $NoProxyValue } | ConvertTo-Json | Set-Content -Path $secrets -Encoding UTF8
 
     $argLine = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode `"$Mode`" -GithubUser `"$GithubUser`"" +
                " -SecretsFile `"$secrets`" -LogFile `"$log`" -InstallUser `"$User`""
@@ -414,6 +702,10 @@ function Invoke-Elevated([string]$User) {
     if ($OrchestratorUrl) { $argLine += " -OrchestratorUrl `"$OrchestratorUrl`"" }
     if ($NoPull)          { $argLine += " -NoPull" }
     if ($NoFirewall)      { $argLine += " -NoFirewall" }
+    if ($CaFile)          { $argLine += " -CaFile `"$CaFile`"" }
+    if ($HttpsPort)       { $argLine += " -HttpsPort $HttpsPort" }
+    if ($AgentPort)       { $argLine += " -AgentPort $AgentPort" }
+    if ($Replace)         { $argLine += " -Replace" }
 
     Write-Host "The installer needs Administrator rights: approve the Windows prompt. Waiting for the elevated run..."
     try {
@@ -458,7 +750,7 @@ try {
     $message = "ERROR: $($_.Exception.Message)"
     if ($LogFile) { Add-Content -Path $LogFile -Value $message }
     Microsoft.PowerShell.Utility\Write-Host $message -ForegroundColor Red
-    $script:InstallExit = 1
+    $script:InstallExit = if ($script:FailExit) { $script:FailExit } else { 1 }
 } finally {
     if ($SecretsFile) { Remove-Item -Force -ErrorAction SilentlyContinue $SecretsFile }
 }

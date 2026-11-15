@@ -17,8 +17,27 @@
 #
 # Usage:
 #   migratrix-install.sh [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url <URL>] \
-#                        [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
-#   migratrix-install.sh --upgrade [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
+#                        [--github-token <TOKEN>] [--github-user <USER>] [--no-pull] \
+#                        [--proxy <URL>] [--no-proxy <LIST>] [--ca-file <PEM>] \
+#                        [--https-port <PORT>] [--agent-port <PORT>] [--replace]
+#   migratrix-install.sh --upgrade [--github-token <TOKEN>] [--github-user <USER>] [--no-pull] \
+#                        [--proxy <URL>] [--no-proxy <LIST>] [--ca-file <PEM>] [--replace]
+#
+# Exit codes: 0 done; 1 an error (the message says which); 3 the files are prepared but Docker is not installed
+# or not running, so nothing was pulled or started (with --upgrade: .env names the new versions and the containers
+# still run the old ones); 4 a port the agent publishes is already in use on this machine (nothing was written).
+#
+# Outgoing proxy: --proxy, or HTTPS_PROXY / HTTP_PROXY / NO_PROXY of the environment the installer runs in, are
+# written to .env (MIGRATRIX_HTTPS_PROXY, MIGRATRIX_HTTP_PROXY, MIGRATRIX_NO_PROXY) and given to the containers
+# that call out (the agent and the Risk Assessment API). The names of the other containers are always added to
+# the no-proxy list. Image pulls are made by the Docker daemon, which has its own proxy setting.
+#
+# A proxy that inspects TLS: --ca-file <PEM> (or MIGRATRIX_EXTRA_CA_FILE) adds the proxy's CA to what the agent
+# and the Risk Assessment API trust (certs/extra-ca.pem, joined with the image's own CA list in
+# certs/ca-bundle.pem).
+#
+# A second agent on a key whose agent is connected is refused and keeps trying. --replace makes this
+# installation take over from the one that is connected, once (MIGRATRIX_AGENT_REPLACE in .env).
 #
 # Image versions: the installer writes the released image tags (versions.env, downloaded and checked by the
 # bootstrap) into .env. They are fixed tags - nothing here follows "latest" - so the machine stays on them until
@@ -44,11 +63,19 @@ GITHUB_TOKEN=""
 GITHUB_USER="migratrix-bot"
 PULL=1
 UPGRADE=0
+PROXY=""
+NO_PROXY_OPT=""
+NO_PROXY_GIVEN=0
+CA_FILE=""
+HTTPS_PORT_OPT=""
+AGENT_PORT_OPT=""
+REPLACE=0
 
 usage() {
   cat >&2 <<EOF
 Usage: $0 [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url <URL>] [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
-       $0 --upgrade [--github-token <TOKEN>] [--github-user <USER>] [--no-pull]
+          [--proxy <URL>] [--no-proxy <LIST>] [--ca-file <PEM>] [--https-port <PORT>] [--agent-port <PORT>] [--replace]
+       $0 --upgrade [--github-token <TOKEN>] [--github-user <USER>] [--no-pull] [--proxy <URL>] [--no-proxy <LIST>] [--ca-file <PEM>] [--replace]
 
   --api-key       Migratrix agent API key, from Settings → Agents in the Platform. Without it the installer
                   reads MIGRATRIX_API_KEY from the environment, or asks for the key without echoing it.
@@ -66,6 +93,23 @@ Usage: $0 [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url 
   --no-pull       Do not pull the images now (local builds, or Docker not running yet)
   --upgrade       Move an installed agent to the released image versions: keeps its key, mode and host,
                   writes the new versions into .env, pulls them and restarts the containers
+  --proxy         The outgoing proxy the agent and the Risk Assessment API use to reach Migratrix, for example
+                  http://proxy.example.com:3128. Without it the installer takes HTTPS_PROXY / HTTP_PROXY /
+                  NO_PROXY from the environment, or keeps what .env already holds. "--proxy none" removes it.
+                  Image pulls are made by the Docker daemon: give it the proxy in its own settings.
+  --no-proxy      Hosts reached without the proxy, comma separated (your database servers, for example).
+                  The names of the other Migratrix containers are always added.
+  --ca-file       A PEM file with the CA of a proxy that inspects TLS: added to what the agent and the Risk
+                  Assessment API trust. Also MIGRATRIX_EXTRA_CA_FILE. "--ca-file none" removes it.
+  --https-port    The host port for HTTPS (HTTPS_PORT in .env, 443 by default)
+  --agent-port    The host port for the agent's direct entry (AGENT_PORT in .env, 4002 by default)
+  --replace       Take over from another installation that is connected with the same key. Without it a second
+                  agent on a key is refused while the first is connected, and keeps trying: stop the other
+                  agent, or run the installer again with --replace, or regenerate the key in Settings → Agents.
+                  The takeover happens once: the agent remembers that it used it.
+
+Exit codes: 0 done; 1 error; 3 prepared, but Docker is not installed or not running (nothing pulled or started);
+            4 a published port is already in use (nothing written).
 EOF
   exit 1
 }
@@ -80,6 +124,12 @@ while [ $# -gt 0 ]; do
     --github-user)  GITHUB_USER="${2:-}"; shift 2 ;;
     --no-pull)      PULL=0; shift ;;
     --upgrade)      UPGRADE=1; shift ;;
+    --proxy)        PROXY="${2:-}"; shift 2 ;;
+    --no-proxy)     NO_PROXY_OPT="${2:-}"; NO_PROXY_GIVEN=1; shift 2 ;;
+    --ca-file)      CA_FILE="${2:-}"; shift 2 ;;
+    --https-port)   HTTPS_PORT_OPT="${2:-}"; shift 2 ;;
+    --agent-port)   AGENT_PORT_OPT="${2:-}"; shift 2 ;;
+    --replace)      REPLACE=1; shift ;;
     -h|--help) usage ;;
     *) echo "error: unknown argument: $1" >&2; usage ;;
   esac
@@ -179,6 +229,135 @@ case "$GITHUB_TOKEN" in
   *xxxx*|"<"*">") echo "error: --github-token is a placeholder; leave it out to pull anonymously, or pass the token Migratrix gave you" >&2; exit 1 ;;
 esac
 
+# --- outgoing proxy -----------------------------------------------------------
+# The option, then the environment the installer runs in, then what an earlier run wrote to .env.
+# Never shown with its user name and password.
+mask_url() { printf '%s' "$1" | sed -E 's#(://)[^/@]*@#\1***@#'; }
+check_proxy_url() { # check_proxy_url <what> <value>
+  [ -z "$2" ] && return 0
+  case "$2" in
+    http://*|https://*) : ;;
+    *) echo "error: $1 must be a URL that starts with http:// or https:// (for example http://proxy.example.com:3128)" >&2; exit 1 ;;
+  esac
+  case "$2" in
+    *[[:space:]\$\'\"\`]*) echo "error: $1 holds a space, a quote or a \$ sign; write such characters of the user name or password percent-encoded (%24 for \$)" >&2; exit 1 ;;
+  esac
+}
+HTTPS_PROXY_VAL=""; HTTP_PROXY_VAL=""; NO_PROXY_VAL=""
+if [ "$PROXY" = "none" ]; then
+  : # no proxy: also drops what .env held
+elif [ -n "$PROXY" ]; then
+  HTTPS_PROXY_VAL="$PROXY"; HTTP_PROXY_VAL="$PROXY"
+else
+  HTTPS_PROXY_VAL="${HTTPS_PROXY:-${https_proxy:-}}"
+  HTTP_PROXY_VAL="${HTTP_PROXY:-${http_proxy:-}}"
+  if [ -z "$HTTPS_PROXY_VAL$HTTP_PROXY_VAL" ]; then
+    HTTPS_PROXY_VAL="$(value_of "$ENV_FILE" MIGRATRIX_HTTPS_PROXY)"
+    HTTP_PROXY_VAL="$(value_of "$ENV_FILE" MIGRATRIX_HTTP_PROXY)"
+  fi
+fi
+check_proxy_url "the HTTPS proxy" "$HTTPS_PROXY_VAL"
+check_proxy_url "the HTTP proxy" "$HTTP_PROXY_VAL"
+if [ -n "$HTTPS_PROXY_VAL$HTTP_PROXY_VAL" ]; then
+  if [ "$NO_PROXY_GIVEN" = "1" ]; then NO_PROXY_VAL="$NO_PROXY_OPT"
+  else
+    NO_PROXY_VAL="${NO_PROXY:-${no_proxy:-}}"
+    [ -n "$NO_PROXY_VAL" ] || NO_PROXY_VAL="$(value_of "$ENV_FILE" MIGRATRIX_NO_PROXY)"
+  fi
+  case "$NO_PROXY_VAL" in
+    *[[:space:]\$\'\"\`]*) NO_PROXY_VAL="$(printf '%s' "$NO_PROXY_VAL" | tr -d " \t\$'\"\`")" ;;
+  esac
+  # The other containers are reached by name, never through the proxy.
+  merged=""
+  for name in $(printf '%s' "$NO_PROXY_VAL" | tr ',' ' ') localhost 127.0.0.1 risk-assessment sqlglot java-analyzer python-analyzer host.docker.internal; do
+    case ",$merged," in *",$name,"*) : ;; *) merged="${merged:+$merged,}$name" ;; esac
+  done
+  NO_PROXY_VAL="$merged"
+fi
+
+# --- extra CA (a proxy that inspects TLS) ---------------------------------------
+[ -n "$CA_FILE" ] || CA_FILE="${MIGRATRIX_EXTRA_CA_FILE:-}"
+if [ -n "$CA_FILE" ] && [ "$CA_FILE" != "none" ]; then
+  [ -f "$CA_FILE" ] || { echo "error: --ca-file: $CA_FILE does not exist" >&2; exit 1; }
+  grep -q -- '-----BEGIN CERTIFICATE-----' "$CA_FILE" || {
+    echo "error: --ca-file: $CA_FILE is not a PEM certificate file (no '-----BEGIN CERTIFICATE-----' line)." >&2
+    echo "       A .cer / .der file can be converted with: openssl x509 -inform der -in <file> -out ca.pem" >&2
+    exit 1; }
+fi
+
+# --- the published ports must be free -------------------------------------------
+# Checked before anything is written. A port held by this installation's own proxy container is fine.
+for pair in "HTTPS_PORT:$HTTPS_PORT_OPT:--https-port" "AGENT_PORT:$AGENT_PORT_OPT:--agent-port"; do
+  opt="${pair#*:}"; opt="${opt%%:*}"
+  case "$opt" in
+    "") : ;;
+    *[!0-9]*) echo "error: ${pair##*:} must be a port number" >&2; exit 1 ;;
+    *) if [ "$opt" -lt 1 ] || [ "$opt" -gt 65535 ]; then echo "error: ${pair##*:} must be between 1 and 65535" >&2; exit 1; fi ;;
+  esac
+done
+HTTPS_PORT_VAL="${HTTPS_PORT_OPT:-$(value_of "$ENV_FILE" HTTPS_PORT)}"; HTTPS_PORT_VAL="${HTTPS_PORT_VAL:-443}"
+AGENT_PORT_VAL="${AGENT_PORT_OPT:-$(value_of "$ENV_FILE" AGENT_PORT)}"; AGENT_PORT_VAL="${AGENT_PORT_VAL:-4002}"
+if [ "$HTTPS_PORT_VAL" = "$AGENT_PORT_VAL" ]; then
+  echo "error: HTTPS_PORT and AGENT_PORT are both $HTTPS_PORT_VAL; they must differ" >&2; exit 1
+fi
+
+DOCKER_UP=0
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then DOCKER_UP=1; fi
+
+# 0 when something listens on TCP port $1 of this machine. The first tool that is there decides.
+port_in_use() {
+  local p="$1" out
+  if command -v ss >/dev/null 2>&1 && out="$(ss -ltn 2>/dev/null)"; then
+    printf '%s\n' "$out" | awk -v p="$p" '$4 ~ ("[:.]" p "$") { found = 1 } END { exit found ? 0 : 1 }'; return $?
+  fi
+  if command -v netstat >/dev/null 2>&1 && out="$(netstat -an 2>/dev/null)"; then
+    printf '%s\n' "$out" | awk -v p="$p" 'toupper($0) ~ /LISTEN/ && $4 ~ ("[:.]" p "$") { found = 1 } END { exit found ? 0 : 1 }'; return $?
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; return $?
+  fi
+  if command -v nc >/dev/null 2>&1; then
+    nc -z 127.0.0.1 "$p" >/dev/null 2>&1; return $?
+  fi
+  (exec 3<>"/dev/tcp/127.0.0.1/$p") >/dev/null 2>&1
+}
+# Ports this installation's own proxy container already publishes (a re-run or an upgrade).
+OWN_PORTS=""
+if [ "$DOCKER_UP" = "1" ]; then
+  OWN_PORTS="$(docker ps --filter 'name=^migratrix-traefik$' --format '{{.Ports}}' 2>/dev/null || true)"
+fi
+port_holder() { # best effort: who holds port $1
+  local p="$1" who=""
+  if [ "$DOCKER_UP" = "1" ]; then
+    who="$(docker ps --filter "publish=$p" --format '{{.Names}}' 2>/dev/null | head -n1 || true)"
+    [ -n "$who" ] && { printf 'the Docker container %s' "$who"; return 0; }
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    who="$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $1 " (pid " $2 ")"}' || true)"
+    [ -n "$who" ] && printf '%s' "$who"
+  fi
+  return 0
+}
+PORT_TAKEN=0
+for pair in "HTTPS_PORT:$HTTPS_PORT_VAL:--https-port" "AGENT_PORT:$AGENT_PORT_VAL:--agent-port"; do
+  key="${pair%%:*}"; opt="${pair##*:}"; port="${pair#*:}"; port="${port%%:*}"
+  case "$OWN_PORTS" in *":$port->"*) continue ;; esac
+  if port_in_use "$port"; then
+    PORT_TAKEN=1
+    holder="$(port_holder "$port")"
+    echo "error: port $port on this machine is already in use${holder:+ by $holder}. The agent's proxy publishes it ($key)." >&2
+    echo "       Free the port, or choose another one: run the installer again with $opt <port>" >&2
+    echo "       (it writes $key to $ENV_FILE)." >&2
+    if [ "$key" = "HTTPS_PORT" ]; then
+      echo "       With another HTTPS port the agent's address carries it: https://<host>:<port>." >&2
+    fi
+  fi
+done
+if [ "$PORT_TAKEN" = "1" ]; then
+  echo "       Nothing was installed or started." >&2
+  exit 4
+fi
+
 mkdir -p "$CERTS_DIR" "$DYNAMIC_DIR"
 
 # Point Traefik's file provider at /certs/<basename> (+ matching -key.pem).
@@ -188,6 +367,14 @@ tls:
   certificates:
     - certFile: /certs/$1
       keyFile: /certs/${1%.pem}-key.pem
+  # Also the default certificate: a client that connects by address sends no server name, and Traefik would
+  # answer it with its own "TRAEFIK DEFAULT CERT" (onboarding trials round 2, N-R2A-1). The agent writes the
+  # same block when it publishes its certificate.
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/$1
+        keyFile: /certs/${1%.pem}-key.pem
 EOF
 }
 
@@ -247,7 +434,51 @@ set_env() {
   fi
   printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
 }
+unset_env() {
+  local key="$1" tmp
+  if grep -qE "^${key}=" "$ENV_FILE"; then
+    tmp="$(mktemp)"; grep -vE "^${key}=" "$ENV_FILE" > "$tmp" || true; cat "$tmp" > "$ENV_FILE"; rm -f "$tmp"
+  fi
+}
 set_env MIGRATRIX_MODE "$MODE"
+[ -n "$HTTPS_PORT_OPT" ] && set_env HTTPS_PORT "$HTTPS_PORT_OPT"
+[ -n "$AGENT_PORT_OPT" ] && set_env AGENT_PORT "$AGENT_PORT_OPT"
+# The outgoing proxy of the agent and the Risk Assessment API. Under their own names: docker compose prefers
+# the shell's variables to .env, and a NO_PROXY of the shell would drop the container names added here.
+PROXY_NOTE=""
+if [ -n "$HTTPS_PROXY_VAL$HTTP_PROXY_VAL" ]; then
+  if [ -n "$HTTPS_PROXY_VAL" ]; then set_env MIGRATRIX_HTTPS_PROXY "$HTTPS_PROXY_VAL"; else unset_env MIGRATRIX_HTTPS_PROXY; fi
+  if [ -n "$HTTP_PROXY_VAL" ]; then set_env MIGRATRIX_HTTP_PROXY "$HTTP_PROXY_VAL"; else unset_env MIGRATRIX_HTTP_PROXY; fi
+  set_env MIGRATRIX_NO_PROXY "$NO_PROXY_VAL"
+  PROXY_NOTE="$(mask_url "${HTTPS_PROXY_VAL:-$HTTP_PROXY_VAL}")"
+  echo "Outgoing proxy for the agent and the Risk Assessment API: $PROXY_NOTE"
+  echo "   not through the proxy: $NO_PROXY_VAL"
+  echo "   Image pulls are made by the Docker daemon, which does not read this: if the pull below cannot reach the"
+  echo "   registry, give Docker the proxy (Docker Desktop: Settings > Resources > Proxies; Linux: a systemd drop-in"
+  echo "   with HTTPS_PROXY for docker.service, then restart Docker)."
+else
+  unset_env MIGRATRIX_HTTPS_PROXY; unset_env MIGRATRIX_HTTP_PROXY; unset_env MIGRATRIX_NO_PROXY
+fi
+# The extra CA: kept as certs/extra-ca.pem; the list the containers read is built after the images are here.
+EXTRA_CA="$CERTS_DIR/extra-ca.pem"
+CA_BUNDLE="$CERTS_DIR/ca-bundle.pem"
+if [ "$CA_FILE" = "none" ]; then
+  rm -f "$EXTRA_CA" "$CA_BUNDLE"
+  unset_env MIGRATRIX_SSL_CERT_FILE
+  echo "Extra CA removed: the containers trust their own CA list only."
+elif [ -n "$CA_FILE" ]; then
+  # Not the same file (a re-run with --ca-file certs/extra-ca.pem).
+  if [ ! "$CA_FILE" -ef "$EXTRA_CA" ]; then cp "$CA_FILE" "$EXTRA_CA"; fi
+  chmod 644 "$EXTRA_CA"
+  echo "Extra CA copied to $EXTRA_CA"
+fi
+# Take over from another installation on the same key: only for the start that asked for it.
+if [ "$REPLACE" = "1" ]; then
+  set_env MIGRATRIX_AGENT_REPLACE "$(date +%s)"
+  echo "--replace: this agent takes over from the installation that is connected with the same key (once)."
+else
+  unset_env MIGRATRIX_AGENT_REPLACE
+fi
 [ -n "$HOST" ] && set_env AGENT_HOST "$HOST"
 set_env MIGRATRIX_API_KEY "$API_KEY"
 [ -n "$ORCHESTRATOR_URL" ] && set_env MIGRATRIX_ORCHESTRATOR_URL "${ORCHESTRATOR_URL%/}"
@@ -263,9 +494,16 @@ fi
 # The released image versions. What ran before is kept for the summary of an upgrade.
 VERSION_SUMMARY=""
 VERSIONS_CHANGED=0
+# An install made by the installer of before fixed versions has one line for all five images, TAG=latest. Nothing
+# reads it any more: it is removed, and the summary says what the images ran on ("was latest").
+LEGACY_TAG="$(value_of "$ENV_FILE" TAG)"
+if grep -qE '^TAG=' "$ENV_FILE"; then
+  tmp="$(mktemp)"; grep -vE '^TAG=' "$ENV_FILE" > "$tmp" || true; cat "$tmp" > "$ENV_FILE"; rm -f "$tmp"
+fi
 for key in $IMAGE_KEYS; do
   new="$(value_of "$VERSIONS_FILE" "$key")"
   old="$(value_of "$ENV_FILE" "$key")"
+  [ -z "$old" ] && old="$LEGACY_TAG"
   if [ "$old" = "$new" ]; then
     VERSION_SUMMARY="$VERSION_SUMMARY   $key=$new (unchanged)
 "
@@ -308,15 +546,19 @@ else
 fi
 
 # --- pull the images ---------------------------------------------------------
+DOCKER_DOWN=0
 if [ "$PULL" = "1" ]; then
-  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  if [ "$DOCKER_UP" != "1" ]; then
     if [ "$UPGRADE" = "1" ]; then
-      echo "error: Docker is not installed or not running, so the new images were not pulled and the containers" >&2
-      echo "       still run the versions they had. .env already names the new versions: start Docker and run" >&2
+      # Exit code 3, as for an install: prepared, not started (the table in the header).
+      echo "" >&2
+      echo "⚠️  Prepared, NOT upgraded: Docker is not installed or not running, so the new images were not pulled and" >&2
+      echo "   the containers still run the versions they had. .env already names the new versions: start Docker and run" >&2
       echo "       docker compose pull && docker compose up -d   in $REPO_ROOT" >&2
-      exit 1
+      exit 3
     fi
-    echo "Docker is not installed or not running: the images are pulled when you run docker compose up -d"
+    DOCKER_DOWN=1
+    echo "Docker is not installed or not running: no image was pulled."
   elif ! (cd "$REPO_ROOT" && docker compose pull); then
     echo "" >&2
     echo "error: could not pull the Migratrix images from ${REGISTRY_PREFIX:-$REGISTRY_HOST}." >&2
@@ -333,6 +575,30 @@ if [ "$PULL" = "1" ]; then
   fi
 fi
 
+# --- extra CA: the list the containers read --------------------------------------
+# SSL_CERT_FILE replaces the image's CA list, it does not add to it: the file given to the containers is the
+# image's own list followed by the extra CA. Rebuilt on every run (a new image may carry a newer list).
+CA_NOTE=""
+if [ -f "$EXTRA_CA" ]; then
+  AGENT_IMAGE="${REGISTRY_PREFIX}migratrix-agent:$(value_of "$ENV_FILE" AGENT_TAG)"
+  tmp_bundle="$(mktemp)"
+  if [ "$DOCKER_UP" = "1" ] && docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1 \
+     && docker run --rm --network none --entrypoint cat "$AGENT_IMAGE" /etc/ssl/certs/ca-certificates.crt > "$tmp_bundle" 2>/dev/null \
+     && grep -q -- '-----BEGIN CERTIFICATE-----' "$tmp_bundle"; then
+    { cat "$tmp_bundle"; printf '\n'; cat "$EXTRA_CA"; printf '\n'; } > "$CA_BUNDLE"
+    chmod 644 "$CA_BUNDLE"
+    set_env MIGRATRIX_SSL_CERT_FILE /certs/ca-bundle.pem
+    chmod 600 "$ENV_FILE"
+    echo "Extra CA: the agent and the Risk Assessment API trust $EXTRA_CA in addition to their own CA list ($CA_BUNDLE)"
+  elif [ -f "$CA_BUNDLE" ] && [ -n "$(value_of "$ENV_FILE" MIGRATRIX_SSL_CERT_FILE)" ] && [ -z "$CA_FILE" ]; then
+    echo "Extra CA: the CA list built by an earlier run is kept ($CA_BUNDLE)"
+  else
+    CA_NOTE="The extra CA is saved ($EXTRA_CA) but NOT in use yet: the CA list is built from the agent image, which is not on this machine. Run the installer again, with Docker running and without --no-pull."
+    echo "warning: $CA_NOTE" >&2
+  fi
+  rm -f "$tmp_bundle"
+fi
+
 # --- upgrade: restart on the new images ---------------------------------------
 if [ "$UPGRADE" = "1" ]; then
   if [ "$PULL" = "0" ]; then
@@ -345,6 +611,9 @@ if [ "$UPGRADE" = "1" ]; then
   if ! (cd "$REPO_ROOT" && docker compose up -d --remove-orphans); then
     echo "error: the new images were pulled but the containers could not be restarted; see the message above." >&2
     echo "       Run   docker compose up -d   in $REPO_ROOT   once it is solved." >&2
+    echo "       Nothing was removed. The containers of this installation now:" >&2
+    (cd "$REPO_ROOT" && docker compose ps --all --format 'table {{.Name}}\t{{.Status}}' >&2) || true
+    echo "       docker compose down   in $REPO_ROOT   stops them." >&2
     exit 1
   fi
   echo ""
@@ -358,19 +627,48 @@ if [ "$UPGRADE" = "1" ]; then
 fi
 
 # --- next steps ------------------------------------------------------------
-cat <<EOF
+if [ "$DOCKER_DOWN" = "1" ]; then
+  # Not the green "Done", and not exit 0: nothing was pulled and nothing runs (onboarding trials ERR-05).
+  cat >&2 <<EOF
+
+⚠️  Prepared, NOT started (mode: $MODE): Docker is not installed or not running on this machine.
+   The settings are in $ENV_FILE, but no image was pulled and no container runs.
+   Start Docker (or install it: https://docs.docker.com/get-docker/), then:
+   cd "$REPO_ROOT"
+   docker compose pull && docker compose up -d
+EOF
+  [ -n "$CA_NOTE" ] && echo "   $CA_NOTE" >&2
+  echo "   (To prepare the files on purpose without Docker, run the installer with --no-pull: it then ends with exit code 0.)" >&2
+  exit 3
+fi
+if [ "$PULL" = "0" ]; then
+  cat <<EOF
+
+✅ Prepared (mode: $MODE; --no-pull: no image was pulled, nothing was started). Start the agent:
+   cd "$REPO_ROOT"
+   docker compose up -d
+EOF
+else
+  cat <<EOF
 
 ✅ Done (mode: $MODE). Start the agent:
    cd "$REPO_ROOT"
    docker compose up -d
 EOF
+fi
+[ -n "$CA_NOTE" ] && echo "   ⚠️  $CA_NOTE"
+[ -n "$PROXY_NOTE" ] && echo "   The agent reaches Migratrix through the proxy $PROXY_NOTE."
+if [ "$REPLACE" = "1" ]; then
+  echo "   This start takes over from the agent that is connected with the same key; that one then stops serving."
+fi
 case "$MODE" in
   localhost) echo "   Agent will be reachable at: https://$HOST - from a browser on this machine only."
              if is_headless; then
                echo "   This machine has no desktop: for a browser on another machine, run the installer again with"
                echo "   --mode managed, --mode custom --host <your domain> or --mode ip --host <address>."
              fi ;;
-  custom|ip) echo "   Reachable at: https://$HOST once the agent connects and its certificate is applied."
+  custom|ip) if [ "$HTTPS_PORT_VAL" = "443" ]; then REACH="https://$HOST"; else REACH="https://$HOST:$HTTPS_PORT_VAL"; fi
+             echo "   Reachable at: $REACH once the agent connects and its certificate is applied."
              echo "   The HTTPS port (HTTPS_PORT in .env, 443 by default) must be open to the browsers that use the Platform." ;;
   managed)   echo "   Migratrix will assign a subdomain + certificate after the agent connects." ;;
 esac
@@ -379,6 +677,8 @@ cat <<EOF
    Then check that the agent connected - a wrong key or an unreachable orchestrator is said there, in words:
    docker compose logs -f agent
    and on the Platform: Settings → Agents shows the agent as Connected.
+   If the log says another agent is connected with this key: stop that agent, or run the installer again with
+   --replace, or regenerate the key in Settings → Agents.
 
    The agent stays on the versions installed now. To move it to a newer release, run the install command again
    with --upgrade in place of its other options.

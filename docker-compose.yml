@@ -59,6 +59,19 @@ services:
       MIGRATRIX_DATA_MCP_RESOURCE: "https://${AGENT_HOST:-agent.localhost}/mcp"
       # The Risk Assessment API beside the agent: turns on code_impact on the Executor MCP.
       MIGRATRIX_RISK_URL: "http://risk-assessment:4003"
+      # Outgoing proxy, when the machine reaches Migratrix through one (the installer's --proxy / -Proxy, or
+      # HTTPS_PROXY of its environment). Under MIGRATRIX_* names in .env, so that a NO_PROXY of the shell that
+      # runs docker compose does not replace the list with the container names in it. Empty: no proxy.
+      HTTPS_PROXY: "${MIGRATRIX_HTTPS_PROXY:-}"
+      HTTP_PROXY: "${MIGRATRIX_HTTP_PROXY:-}"
+      NO_PROXY: "${MIGRATRIX_NO_PROXY:-}"
+      # The CA list the agent trusts. The default is the image's own list. With an extra CA (a proxy that
+      # inspects TLS; the installer's --ca-file / -CaFile) it is /certs/ca-bundle.pem: the image's list plus
+      # that CA. The variable replaces the list, so it must never name a file with the extra CA alone.
+      SSL_CERT_FILE: "${MIGRATRIX_SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}"
+      # Set by the installer's --replace / -Replace for one start: take over from another installation that is
+      # connected with the same key. The agent remembers the value it used and ignores it afterwards.
+      MIGRATRIX_AGENT_REPLACE: "${MIGRATRIX_AGENT_REPLACE:-}"
     volumes:
       - migratrix-data:/data/migratrix
       - ./certs:/certs
@@ -96,8 +109,14 @@ services:
       Webhooks__GitLabToken:  "${MIGRATRIX_GITLAB_WEBHOOK_TOKEN:-}"
       # The Platform origin the Risk page is opened from, when it is not the hosted Platform (on-prem).
       Cors__AllowedOrigins__0: "${MIGRATRIX_PLATFORM_ORIGIN:-}"
+      # The same outgoing proxy and CA list as the agent (the orchestrator's public keys, repository hosts).
+      HTTPS_PROXY: "${MIGRATRIX_HTTPS_PROXY:-}"
+      HTTP_PROXY: "${MIGRATRIX_HTTP_PROXY:-}"
+      NO_PROXY: "${MIGRATRIX_NO_PROXY:-}"
+      SSL_CERT_FILE: "${MIGRATRIX_SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}"
     volumes:
       - migratrix-data:/data/migratrix
+      - ./certs:/certs:ro
     depends_on:
       - java-analyzer
       - python-analyzer
