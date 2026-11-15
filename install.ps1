@@ -25,42 +25,102 @@
   line "ERROR: ..."; otherwise the installer's: 0 done, 1 an error, 3 prepared but Docker is not running,
   4 a published port is in use.
 #>
-[CmdletBinding()]
-param(
-    # Left out: localhost on a desktop Windows; Windows Server has no default and the installer asks for one.
-    # Checked below, not by ValidateSet: a refused parameter is answered by PowerShell with a raw error record.
-    [string]$Mode = "",
-    [string]$HostName = "",
-    # Left out: the installer reads MIGRATRIX_API_KEY, or asks for the key without echoing it.
-    [string]$ApiKey = "",
-    [string]$OrchestratorUrl = "",
-    [string]$GithubToken = "",
-    [string]$GithubUser = "migratrix-bot",
-    [switch]$NoPull,
-    [switch]$NoFirewall,
-    # An installed agent: write the released image versions, pull them and restart; key, mode and host are kept.
-    [switch]$Upgrade,
-    # The outgoing proxy (also used for the downloads below). Left out: HTTPS_PROXY of the environment.
-    [string]$Proxy = "",
-    [string]$NoProxy = "",
-    # The CA of a proxy that inspects TLS, as a PEM file.
-    [string]$CaFile = "",
-    [int]$HttpsPort = 0,
-    [int]$AgentPort = 0,
-    # Take over, once, from another installation that is connected with the same key.
-    [switch]$Replace
-)
+# The options (read below, see Read-InstallerOptions):
+#   -Mode <localhost|managed|custom|ip>   left out: localhost on a desktop Windows; Windows Server has no default
+#   -HostName <name>                      the name or address the agent is reached on (modes custom, ip)
+#   -ApiKey <key>                         left out: MIGRATRIX_API_KEY, or the installer asks without echoing
+#   -OrchestratorUrl <url>  -GithubToken <token>  -GithubUser <user>
+#   -NoPull  -NoFirewall
+#   -Upgrade                              an installed agent: the released versions; key, mode and host are kept
+#   -Proxy <url|none>  -NoProxy <list>    the outgoing proxy (also of the downloads below); left out: HTTPS_PROXY
+#   -CaFile <pem|none>                    the CA of a proxy that inspects TLS
+#   -HttpsPort <port>  -AgentPort <port>
+#   -Replace                              take over, once, from another installation connected with the same key
+$bootstrapTokens = $args
 
 $ErrorActionPreference = 'Stop'
 
 # Everything the bootstrap itself refuses ends the same way as the installer's refusals: one line "ERROR: ..." and
 # exit code 1, not PowerShell's error record with a script position ("At ...install.ps1:79 char:9 + throw ...").
 try {
+# The options are read here, not by a param() block: PowerShell answers a wrong option name, a missing value or a
+# port that is not a number itself, before the script runs, with a raw error record ("A parameter cannot be found
+# that matches parameter name ...", with a script position). Read here, each of them ends as one line "ERROR: ..."
+# with the list of options (INST-2). Names are matched whole, in any letter case; "-Name value" and "-Name:value".
+function Read-InstallerOptions([object[]]$Tokens, [string[]]$ValueNames, [string[]]$SwitchNames, [string[]]$Shown) {
+    $options = @{}
+    $given = @{}
+    foreach ($n in $ValueNames) { $options[$n] = '' }
+    foreach ($n in $SwitchNames) { $options[$n] = $false }
+    $all = @($ValueNames) + @($SwitchNames)
+    $hint = "Options: " + ((@($Shown) | ForEach-Object { "-$_" }) -join ', ') + ". Nothing was installed."
+    $i = 0
+    $count = @($Tokens).Count
+    while ($i -lt $count) {
+        $token = [string]$Tokens[$i]; $i++
+        if ($token -notmatch '^-([A-Za-z]+)(:(.*))?$') {
+            throw "Unexpected argument '$token': every option is a dash and a name, then its value. $hint"
+        }
+        $name = $Matches[1]; $hasInline = [bool]$Matches[2]; $inline = [string]$Matches[3]
+        $known = $all | Where-Object { $_ -ieq $name } | Select-Object -First 1
+        if (-not $known) { throw "Unknown option -$name. $hint" }
+        $given[$known] = $true
+        if ($SwitchNames -contains $known) {
+            $value = 'true'
+            if ($hasInline) {
+                if ($inline -ne '') { $value = $inline }
+                elseif ($i -lt $count) { $value = [string]$Tokens[$i]; $i++ }
+            }
+            $options[$known] = ($value -notmatch '^(false|0|\$false)$')
+            continue
+        }
+        if ($hasInline -and $inline -ne '') { $options[$known] = $inline; continue }
+        $next = $null
+        if ($i -lt $count) { $next = $Tokens[$i] }
+        $nextIsOption = ($next -is [string]) -and ($next -match '^-([A-Za-z]+):?$') -and [bool]($all | Where-Object { $_ -ieq $Matches[1] })
+        if ($null -eq $next -or $nextIsOption) { throw "Option -$known needs a value. $hint" }
+        # An unquoted list (a,b) arrives as an array: it is one comma separated value.
+        $options[$known] = if ($next -is [array]) { $next -join ',' } else { [string]$next }
+        $i++
+    }
+    $options['Given'] = $given
+    return $options
+}
+
+# A port option: empty (not given) is 0; anything else must be a number from 1 to 65535.
+function ConvertTo-Port([string]$Option, [string]$Value) {
+    if ($Value -eq '') { return 0 }
+    if ($Value -notmatch '^[0-9]{1,5}$' -or [int]$Value -lt 1 -or [int]$Value -gt 65535) {
+        throw "$Option '$Value' is not a port (a number from 1 to 65535). Nothing was installed."
+    }
+    return [int]$Value
+}
+
+function Assert-ProxyUrl([string]$What, [string]$Value) {
+    if (-not $Value) { return }
+    if ($Value -notmatch '^https?://') { throw "$What must be a URL that starts with http:// or https:// (for example http://proxy.example.com:3128). Nothing was installed." }
+    if ($Value -match '[\s$''"`]') { throw "$What holds a space, a quote or a `$ sign; write such characters of the user name or password percent-encoded (%24 for `$). Nothing was installed." }
+}
+
+$valueNames  = @('Mode', 'HostName', 'ApiKey', 'OrchestratorUrl', 'GithubToken', 'GithubUser', 'Proxy', 'NoProxy', 'CaFile', 'HttpsPort', 'AgentPort')
+$switchNames = @('NoPull', 'NoFirewall', 'Upgrade', 'Replace')
+$read = Read-InstallerOptions $bootstrapTokens $valueNames $switchNames ($valueNames + $switchNames)
+$Mode = $read.Mode; $HostName = $read.HostName; $ApiKey = $read.ApiKey; $OrchestratorUrl = $read.OrchestratorUrl
+$GithubToken = $read.GithubToken; $GithubUser = if ($read.GithubUser) { $read.GithubUser } else { 'migratrix-bot' }
+$Proxy = $read.Proxy; $NoProxy = $read.NoProxy; $CaFile = $read.CaFile
+$NoPull = $read.NoPull; $NoFirewall = $read.NoFirewall; $Upgrade = $read.Upgrade; $Replace = $read.Replace
+$noProxyGiven = $read.Given.ContainsKey('NoProxy')
+$HttpsPort = ConvertTo-Port '-HttpsPort' $read.HttpsPort
+$AgentPort = ConvertTo-Port '-AgentPort' $read.AgentPort
 if ($Mode -and @('localhost', 'managed', 'custom', 'ip') -notcontains $Mode) {
     throw "-Mode '$Mode' is not a mode. Use localhost, managed, custom or ip. Nothing was installed."
 }
-foreach ($port in @(@('-HttpsPort', $HttpsPort), @('-AgentPort', $AgentPort))) {
-    if ($port[1] -lt 0 -or $port[1] -gt 65535) { throw "$($port[0]) $($port[1]) is not a port (1 to 65535). Nothing was installed." }
+# The proxy is checked before anything is downloaded through it, with the installer's own rule (INST-4): a value
+# without http:// used to be ignored here without a word, and refused by the installer only after the downloads.
+if ($Proxy -and $Proxy -ne 'none') { Assert-ProxyUrl "-Proxy" $Proxy }
+elseif (-not $Proxy) {
+    Assert-ProxyUrl "The HTTPS proxy of the environment (HTTPS_PROXY)" ([string]$env:HTTPS_PROXY)
+    Assert-ProxyUrl "The HTTP proxy of the environment (HTTP_PROXY)" ([string]$env:HTTP_PROXY)
 }
 
 $Base    = if ($env:MIGRATRIX_BASE_URL) { $env:MIGRATRIX_BASE_URL } else { "https://get.migratrix.com" }
@@ -169,7 +229,7 @@ if ($NoPull)          { $installArgs += '-NoPull' }
 if ($NoFirewall)      { $installArgs += '-NoFirewall' }
 if ($Upgrade)         { $installArgs += '-Upgrade' }
 if ($Proxy -eq 'none') { $installArgs += @('-Proxy', 'none') }
-if ($PSBoundParameters.ContainsKey('NoProxy') -and $NoProxy) { $installArgs += @('-NoProxy', $NoProxy) }
+if ($noProxyGiven -and $NoProxy) { $installArgs += @('-NoProxy', $NoProxy) }
 if ($CaFile -and $CaFile -ne 'none') { $installArgs += @('-CaFile', $CaFile) }
 elseif ($CaFile)      { $installArgs += @('-CaFile', 'none') }
 if ($HttpsPort)       { $installArgs += @('-HttpsPort', "$HttpsPort") }
@@ -196,4 +256,11 @@ try {
 # own PowerShell window), "exit" would close that window with the installer's messages in it.
 if ($PSCommandPath) { exit $code }
 $global:LASTEXITCODE = $code
-if ($code -ne 0) { Write-Host "The Migratrix installer failed (exit code $code). See the messages above." -ForegroundColor Red }
+# One closing line per exit code (the table in the header). 3 is not a failure: the files are prepared and Docker
+# is not running (INST-1: it used to read "The Migratrix installer failed (exit code 3)").
+switch ($code) {
+    0 { }
+    3 { Write-Host "The files are prepared, but nothing was started: Docker is not installed or not running (exit code 3). The steps are in the messages above." -ForegroundColor Yellow }
+    4 { Write-Host "Nothing was installed: a port the agent publishes is in use on this machine (exit code 4). See the messages above." -ForegroundColor Red }
+    default { Write-Host "The Migratrix installer failed (exit code $code). See the messages above." -ForegroundColor Red }
+}

@@ -111,6 +111,13 @@ Usage: $0 [--api-key <KEY>] [--mode <MODE>] [--host <HOST>] [--orchestrator-url 
 Exit codes: 0 done; 1 error; 3 prepared, but Docker is not installed or not running (nothing pulled or started);
             4 a published port is already in use (nothing written).
 EOF
+  exit "${1:-1}"
+}
+
+# A refused command line ends with its one-line reason and this pointer, not with the whole usage text, which
+# pushed the reason off the screen (INST-5).
+hint() {
+  echo "       Add --help to the command to list every option. Nothing was installed." >&2
   exit 1
 }
 
@@ -130,8 +137,8 @@ while [ $# -gt 0 ]; do
     --https-port)   HTTPS_PORT_OPT="${2:-}"; shift 2 ;;
     --agent-port)   AGENT_PORT_OPT="${2:-}"; shift 2 ;;
     --replace)      REPLACE=1; shift ;;
-    -h|--help) usage ;;
-    *) echo "error: unknown argument: $1" >&2; usage ;;
+    -h|--help) usage 0 ;;
+    *) echo "error: unknown argument: $1" >&2; hint ;;
   esac
 done
 
@@ -206,9 +213,9 @@ fi
 
 case "$MODE" in
   localhost) [ -n "$HOST" ] || HOST="agent.localhost" ;;
-  custom|ip) [ -n "$HOST" ] || { echo "error: --host is required for --mode $MODE" >&2; usage; } ;;
+  custom|ip) [ -n "$HOST" ] || { echo "error: --host is required for --mode $MODE (your domain, or this machine's address)" >&2; hint; } ;;
   managed)   : ;; # hostname is assigned by Migratrix when the agent registers
-  *) echo "error: invalid --mode '$MODE' (localhost|managed|custom|ip)" >&2; usage ;;
+  *) echo "error: invalid --mode '$MODE' (localhost|managed|custom|ip)" >&2; hint ;;
 esac
 
 # The agent key: the option, the environment, or a prompt that does not echo.
@@ -219,7 +226,7 @@ if [ -z "$API_KEY" ] && ( : > /dev/tty ) 2>/dev/null; then
   IFS= read -rs API_KEY < /dev/tty || API_KEY=""
   printf '\n' > /dev/tty
 fi
-[ -n "$API_KEY" ] || { echo "error: no agent API key: pass --api-key, or set MIGRATRIX_API_KEY" >&2; usage; }
+[ -n "$API_KEY" ] || { echo "error: no agent API key: pass --api-key <key>, or set MIGRATRIX_API_KEY (the key is in Settings → Agents in the Platform)" >&2; hint; }
 
 # Placeholders copied from an example are refused before anything is installed or written.
 case "$API_KEY" in
@@ -321,10 +328,21 @@ port_in_use() {
   fi
   (exec 3<>"/dev/tcp/127.0.0.1/$p") >/dev/null 2>&1
 }
-# Ports this installation's own proxy container already publishes (a re-run or an upgrade).
+# Ports this installation's own proxy container already publishes (a re-run or an upgrade). "Own" is the
+# container Docker Compose started from THIS folder: a running migratrix-traefik of another installation folder
+# holds its ports against this one (INST-3; the check used to exempt any container of that name, and the install
+# then failed later, at "docker compose up", on the container name). A container that does not say which folder
+# it belongs to is taken as this installation's, as before.
+physical_dir() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
 OWN_PORTS=""
+OTHER_INSTALL_DIR=""
 if [ "$DOCKER_UP" = "1" ]; then
-  OWN_PORTS="$(docker ps --filter 'name=^migratrix-traefik$' --format '{{.Ports}}' 2>/dev/null || true)"
+  traefik_dir="$(docker ps --filter 'name=^migratrix-traefik$' --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -n1 || true)"
+  if [ -n "$traefik_dir" ] && [ "$(physical_dir "$traefik_dir")" != "$(physical_dir "$REPO_ROOT")" ]; then
+    OTHER_INSTALL_DIR="$traefik_dir"
+  else
+    OWN_PORTS="$(docker ps --filter 'name=^migratrix-traefik$' --format '{{.Ports}}' 2>/dev/null || true)"
+  fi
 fi
 port_holder() { # best effort: who holds port $1
   local p="$1" who=""
@@ -353,6 +371,11 @@ for pair in "HTTPS_PORT:$HTTPS_PORT_VAL:--https-port" "AGENT_PORT:$AGENT_PORT_VA
     fi
   fi
 done
+if [ "$PORT_TAKEN" = "1" ] && [ -n "$OTHER_INSTALL_DIR" ]; then
+  echo "       Another Migratrix installation on this machine is running, from $OTHER_INSTALL_DIR." >&2
+  echo "       To work on that one, run the installer there (MIGRATRIX_DIR=$OTHER_INSTALL_DIR). To replace it with" >&2
+  echo "       this one, stop it first:  (cd \"$OTHER_INSTALL_DIR\" && docker compose down)" >&2
+fi
 if [ "$PORT_TAKEN" = "1" ]; then
   echo "       Nothing was installed or started." >&2
   exit 4

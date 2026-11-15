@@ -41,10 +41,28 @@ command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1;
 # proxy of the downloads below (curl reads HTTPS_PROXY / https_proxy by itself; the option is exported so that
 # it does the same), and a relative --ca-file is relative to where the command was run, not to the working
 # directory entered below.
+# A proxy value is checked here, before anything is downloaded through it, with the installer's own rule and
+# words (INST-4: a wrong --proxy used to surface as "could not download", or only after the downloads).
+check_proxy_url() { # check_proxy_url <what> <value>
+  [ -z "$2" ] && return 0
+  case "$2" in
+    http://*|https://*) : ;;
+    *) echo "error: $1 must be a URL that starts with http:// or https:// (for example http://proxy.example.com:3128). Nothing was installed." >&2; exit 1 ;;
+  esac
+  case "$2" in
+    *[[:space:]\$\'\"\`]*) echo "error: $1 holds a space, a quote or a \$ sign; write such characters of the user name or password percent-encoded (%24 for \$). Nothing was installed." >&2; exit 1 ;;
+  esac
+}
+PROXY_OPTION=0
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --proxy)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "error: --proxy needs a value: the proxy's URL, or none. Nothing was installed." >&2; exit 1
+      fi
+      PROXY_OPTION=1
+      [ "$2" = "none" ] || check_proxy_url "--proxy" "$2"
       if [ -n "${2:-}" ] && [ "$2" != "none" ]; then export HTTPS_PROXY="$2" HTTP_PROXY="$2" https_proxy="$2" http_proxy="$2"; fi
       if [ "${2:-}" = "none" ]; then unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy; ARGS+=("--proxy" "none"); fi
       shift; [ $# -gt 0 ] && shift ;;
@@ -57,6 +75,11 @@ while [ $# -gt 0 ]; do
 done
 if [ -n "${MIGRATRIX_EXTRA_CA_FILE:-}" ]; then
   case "$MIGRATRIX_EXTRA_CA_FILE" in /*) : ;; *) export MIGRATRIX_EXTRA_CA_FILE="$PWD/$MIGRATRIX_EXTRA_CA_FILE" ;; esac
+fi
+# Without --proxy the installer takes the proxy from the environment: the same check, before the downloads.
+if [ "$PROXY_OPTION" = "0" ]; then
+  check_proxy_url "the HTTPS proxy of the environment (HTTPS_PROXY)" "${HTTPS_PROXY:-${https_proxy:-}}"
+  check_proxy_url "the HTTP proxy of the environment (HTTP_PROXY)" "${HTTP_PROXY:-${http_proxy:-}}"
 fi
 
 # Everything is downloaded into a fresh temporary folder and checked THERE. Only files that passed the check

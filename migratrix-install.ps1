@@ -50,45 +50,102 @@
   powershell -ExecutionPolicy Bypass -File migratrix-install.ps1 -Mode custom -HostName agent.acme.com
   powershell -ExecutionPolicy Bypass -File migratrix-install.ps1 -Upgrade
 #>
-[CmdletBinding()]
-param(
-    [ValidateSet("", "localhost", "managed", "custom", "ip")]
-    [string]$Mode = "",
-    [string]$HostName = "",
-    # The agent key from Settings > Agents in the Platform. Left out: MIGRATRIX_API_KEY, or a hidden prompt.
-    [string]$ApiKey = "",
-    # The orchestrator the agent connects to (default: Migratrix SaaS; on-premise: your own orchestrator's URL).
-    [string]$OrchestratorUrl = "",
-    # Registry read token, when Migratrix gave you one. Without it the images are pulled anonymously.
-    [string]$GithubToken = "",
-    [string]$GithubUser = "migratrix-bot",
-    # Do not pull the images now (local builds, or Docker not running yet).
-    [switch]$NoPull,
-    # Do not add the Windows Firewall rule for the HTTPS port (modes managed / custom / ip).
-    [switch]$NoFirewall,
-    # An installed agent: write the released image versions, pull them and restart; key, mode and host are kept.
-    [switch]$Upgrade,
-    # The outgoing proxy of the agent and the Risk Assessment API, e.g. http://proxy.example.com:3128. Left out:
-    # HTTPS_PROXY / HTTP_PROXY / NO_PROXY of the environment, or what .env already holds. "none" removes it.
-    [string]$Proxy = "",
-    # Hosts reached without the proxy, comma separated. The other Migratrix containers are always added.
-    [string]$NoProxy = "",
-    # A PEM file with the CA of a proxy that inspects TLS. Left out: MIGRATRIX_EXTRA_CA_FILE. "none" removes it.
-    [string]$CaFile = "",
-    # The host ports the agent's proxy publishes (HTTPS_PORT, 443 by default; AGENT_PORT, 4002 by default).
-    [ValidateRange(0, 65535)][int]$HttpsPort = 0,
-    [ValidateRange(0, 65535)][int]$AgentPort = 0,
-    # Take over, once, from another installation that is connected with the same key.
-    [switch]$Replace,
-    # Internal (the elevated run): where the first run left the key and token, where to write the output, and
-    # who started the install.
-    [string]$SecretsFile = "",
-    [string]$LogFile = "",
-    [string]$InstallUser = ""
-)
+# The options (read at the end of this file, before the install starts; see Read-InstallerOptions):
+#   -Mode <localhost|managed|custom|ip>
+#   -HostName <name>
+#   -ApiKey <key>            the agent key from Settings > Agents. Left out: MIGRATRIX_API_KEY, or a hidden prompt.
+#   -OrchestratorUrl <url>   the orchestrator the agent connects to (default: Migratrix SaaS)
+#   -GithubToken <token>     registry read token, when Migratrix gave you one; without it: anonymous pulls
+#   -GithubUser <user>       default migratrix-bot
+#   -NoPull                  do not pull the images now
+#   -NoFirewall              do not add the Windows Firewall rule for the HTTPS port (modes managed / custom / ip)
+#   -Upgrade                 an installed agent: the released versions; key, mode and host are kept
+#   -Proxy <url|none>        the outgoing proxy, e.g. http://proxy.example.com:3128. Left out: HTTPS_PROXY /
+#                            HTTP_PROXY / NO_PROXY of the environment, or what .env already holds.
+#   -NoProxy <list>          hosts reached without the proxy, comma separated
+#   -CaFile <pem|none>       the CA of a proxy that inspects TLS. Left out: MIGRATRIX_EXTRA_CA_FILE.
+#   -HttpsPort <port>  -AgentPort <port>   the host ports (HTTPS_PORT, 443 by default; AGENT_PORT, 4002)
+#   -Replace                 take over, once, from another installation that is connected with the same key
+# Internal (the elevated run): -SecretsFile, -LogFile, -InstallUser.
+$script:InstallerTokens = $args
+# Set from the tokens by Read-Options, below; the names the rest of the script uses.
+$Mode = ""; $HostName = ""; $ApiKey = ""; $OrchestratorUrl = ""; $GithubToken = ""; $GithubUser = "migratrix-bot"
+$NoPull = $false; $NoFirewall = $false; $Upgrade = $false; $Replace = $false
+$Proxy = ""; $NoProxy = ""; $CaFile = ""; $HttpsPort = 0; $AgentPort = 0
+$SecretsFile = ""; $LogFile = ""; $InstallUser = ""
+
+# The options are read here, not by a param() block: PowerShell answers a wrong option name, a missing value or a
+# port that is not a number itself, before the script runs, with a raw error record ("A parameter cannot be found
+# that matches parameter name ...", with a script position). Read here, each of them ends as one line "ERROR: ..."
+# with the list of options (INST-2). Names are matched whole, in any letter case; "-Name value" and "-Name:value".
+function Read-InstallerOptions([object[]]$Tokens, [string[]]$ValueNames, [string[]]$SwitchNames, [string[]]$Shown) {
+    $options = @{}
+    $given = @{}
+    foreach ($n in $ValueNames) { $options[$n] = '' }
+    foreach ($n in $SwitchNames) { $options[$n] = $false }
+    $all = @($ValueNames) + @($SwitchNames)
+    $hint = "Options: " + ((@($Shown) | ForEach-Object { "-$_" }) -join ', ') + ". Nothing was installed."
+    $i = 0
+    $count = @($Tokens).Count
+    while ($i -lt $count) {
+        $token = [string]$Tokens[$i]; $i++
+        if ($token -notmatch '^-([A-Za-z]+)(:(.*))?$') {
+            throw "Unexpected argument '$token': every option is a dash and a name, then its value. $hint"
+        }
+        $name = $Matches[1]; $hasInline = [bool]$Matches[2]; $inline = [string]$Matches[3]
+        $known = $all | Where-Object { $_ -ieq $name } | Select-Object -First 1
+        if (-not $known) { throw "Unknown option -$name. $hint" }
+        $given[$known] = $true
+        if ($SwitchNames -contains $known) {
+            $value = 'true'
+            if ($hasInline) {
+                if ($inline -ne '') { $value = $inline }
+                elseif ($i -lt $count) { $value = [string]$Tokens[$i]; $i++ }
+            }
+            $options[$known] = ($value -notmatch '^(false|0|\$false)$')
+            continue
+        }
+        if ($hasInline -and $inline -ne '') { $options[$known] = $inline; continue }
+        $next = $null
+        if ($i -lt $count) { $next = $Tokens[$i] }
+        $nextIsOption = ($next -is [string]) -and ($next -match '^-([A-Za-z]+):?$') -and [bool]($all | Where-Object { $_ -ieq $Matches[1] })
+        if ($null -eq $next -or $nextIsOption) { throw "Option -$known needs a value. $hint" }
+        # An unquoted list (a,b) arrives as an array: it is one comma separated value.
+        $options[$known] = if ($next -is [array]) { $next -join ',' } else { [string]$next }
+        $i++
+    }
+    $options['Given'] = $given
+    return $options
+}
+
+# A port option: empty (not given) is 0; anything else must be a number from 1 to 65535.
+function ConvertTo-Port([string]$Option, [string]$Value) {
+    if ($Value -eq '') { return 0 }
+    if ($Value -notmatch '^[0-9]{1,5}$' -or [int]$Value -lt 1 -or [int]$Value -gt 65535) {
+        throw "$Option '$Value' is not a port (a number from 1 to 65535). Nothing was installed."
+    }
+    return [int]$Value
+}
+
+function Read-Options {
+    $valueNames  = @('Mode', 'HostName', 'ApiKey', 'OrchestratorUrl', 'GithubToken', 'GithubUser', 'Proxy', 'NoProxy', 'CaFile', 'HttpsPort', 'AgentPort')
+    $switchNames = @('NoPull', 'NoFirewall', 'Upgrade', 'Replace')
+    $internal    = @('SecretsFile', 'LogFile', 'InstallUser')
+    $read = Read-InstallerOptions $script:InstallerTokens ($valueNames + $internal) $switchNames ($valueNames + $switchNames)
+    foreach ($name in @('Mode', 'HostName', 'ApiKey', 'OrchestratorUrl', 'GithubToken', 'Proxy', 'NoProxy', 'CaFile', 'SecretsFile', 'LogFile', 'InstallUser') + $switchNames) {
+        Set-Variable -Scope Script -Name $name -Value $read[$name]
+    }
+    if ($read.GithubUser) { $script:GithubUser = $read.GithubUser }
+    $script:NoProxyGiven = $read.Given.ContainsKey('NoProxy')
+    $script:HttpsPort = ConvertTo-Port '-HttpsPort' $read.HttpsPort
+    $script:AgentPort = ConvertTo-Port '-AgentPort' $read.AgentPort
+    if ($Mode -and @('localhost', 'managed', 'custom', 'ip') -notcontains $Mode) {
+        throw "-Mode '$Mode' is not a mode. Use localhost, managed, custom or ip. Nothing was installed."
+    }
+}
 
 $ErrorActionPreference = 'Stop'
-$script:NoProxyGiven = $PSBoundParameters.ContainsKey('NoProxy')
+$script:NoProxyGiven = $false
 $script:ProxyResolved = $false
 $script:HttpsProxyValue = ""
 $script:HttpProxyValue = ""
@@ -139,6 +196,20 @@ function Get-PortHolder([int]$Port, [bool]$DockerUp) {
         }
     } catch { }
     return ""
+}
+
+# The folder of ANOTHER installation that a running migratrix-traefik belongs to, read from the container's labels
+# (key=value, comma separated, as "docker ps --format {{.Labels}}" prints them); empty when the container is this
+# folder's, or does not say. Folders are compared as Windows compares them: full path, any letter case.
+function Get-OtherInstallDir([string]$Labels, [string]$RepoRoot) {
+    if ($Labels -notmatch '(^|,)com\.docker\.compose\.project\.working_dir=([^,]+)') { return "" }
+    $theirs = $Matches[2].Trim()
+    try {
+        $a = [System.IO.Path]::GetFullPath($theirs).TrimEnd('\', '/')
+        $b = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
+    } catch { return "" }
+    if ($a -ieq $b) { return "" }
+    return $theirs
 }
 
 # S-1-5-32-544 = Administrators, S-1-5-18 = SYSTEM (names differ per Windows language, the ids do not).
@@ -249,12 +320,17 @@ This is Windows Server: the default mode (localhost) would give an agent that on
     if (-not $ApiKey -and $env:MIGRATRIX_API_KEY) { $script:ApiKey = $env:MIGRATRIX_API_KEY }
     if (-not $GithubToken -and $env:MIGRATRIX_GITHUB_TOKEN) { $script:GithubToken = $env:MIGRATRIX_GITHUB_TOKEN }
     if (-not $ApiKey -and [Environment]::UserInteractive -and -not $SecretsFile) {
-        $secure = Read-Host -AsSecureString "Migratrix agent API key (Settings > Agents in the Platform; input is hidden)"
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try { $script:ApiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        # A session that cannot prompt (-NonInteractive, a scheduled task) falls through to the sentence below,
+        # not to PowerShell's own "Read and Prompt functionality is not available".
+        $secure = $null
+        try { $secure = Read-Host -AsSecureString "Migratrix agent API key (Settings > Agents in the Platform; input is hidden)" } catch { }
+        if ($secure) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+            try { $script:ApiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        }
     }
-    if (-not $ApiKey) { throw "No agent API key: pass -ApiKey, or set MIGRATRIX_API_KEY" }
+    if (-not $ApiKey) { throw "No agent API key: pass -ApiKey <key>, or set MIGRATRIX_API_KEY (the key is in Settings > Agents in the Platform). Nothing was installed." }
 
     # Placeholders copied from an example are refused before anything is installed or written.
     if ($ApiKey -match 'xxxx' -or $ApiKey -match '^<.*>$' -or $ApiKey -eq 'mgx_xxx') {
@@ -312,8 +388,16 @@ This is Windows Server: the default mode (localhost) would give an agent that on
     if ($agentPortValue -notmatch '^\d+$') { $agentPortValue = '4002' }
     if ($httpsPortValue -eq $agentPortValue) { throw "HTTPS_PORT and AGENT_PORT are both $httpsPortValue; they must differ" }
     $dockerUp = Test-DockerUp
+    # "Own" is the container Docker Compose started from THIS folder: a running migratrix-traefik of another
+    # installation folder holds its ports against this one (INST-3; the check used to exempt any container of that
+    # name). A container that does not say which folder it belongs to is taken as this installation's, as before.
     $ownPorts = ""
-    if ($dockerUp) { $ownPorts = [string](cmd /c "docker ps --filter name=migratrix-traefik --format {{.Ports}} 2>nul") }
+    $otherInstallDir = ""
+    if ($dockerUp) {
+        $labels = [string](cmd /c "docker ps --filter name=migratrix-traefik --format {{.Labels}} 2>nul" | Select-Object -First 1)
+        $otherInstallDir = Get-OtherInstallDir $labels $RepoRoot
+        if (-not $otherInstallDir) { $ownPorts = [string](cmd /c "docker ps --filter name=migratrix-traefik --format {{.Ports}} 2>nul") }
+    }
     $taken = @()
     foreach ($check in @(@('HTTPS_PORT', $httpsPortValue, '-HttpsPort'), @('AGENT_PORT', $agentPortValue, '-AgentPort'))) {
         $key = $check[0]; $port = $check[1]; $option = $check[2]
@@ -327,6 +411,9 @@ This is Windows Server: the default mode (localhost) would give an agent that on
         }
     }
     if ($taken.Count -gt 0) {
+        if ($otherInstallDir) {
+            $taken += "Another Migratrix installation on this machine is running, from $otherInstallDir. To work on that one, run the installer there (set MIGRATRIX_DIR to that folder). To replace it with this one, stop it first: run 'docker compose down' in that folder."
+        }
         $script:FailExit = 4
         throw (($taken -join " ") + " Nothing was installed or started.")
     }
@@ -727,6 +814,10 @@ function Invoke-Elevated([string]$User) {
 }
 
 # --- run ---------------------------------------------------------------------
+try { Read-Options } catch {
+    Microsoft.PowerShell.Utility\Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
 if ($LogFile) {
     # The elevated run: what the installer says also goes to the log that the first window shows. (No stream
     # redirection: with $ErrorActionPreference = 'Stop' a redirected stderr line of docker would end the run.)
