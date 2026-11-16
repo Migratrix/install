@@ -189,6 +189,17 @@ if [ "$UPGRADE" = "1" ]; then
   fi
 fi
 
+# --replace on a machine that already holds an install is about that install: what the command leaves out (the
+# mode with its host, the key) is read from it, as --upgrade does. Without this a bare --replace on a server
+# stopped at "choose a mode" although the mode was already chosen (onboarding trials, round 5).
+if [ "$REPLACE" = "1" ] && [ "$UPGRADE" != "1" ] && [ -f "$ENV_FILE" ]; then
+  if [ -z "$MODE" ]; then
+    MODE="$(value_of "$ENV_FILE" MIGRATRIX_MODE)"
+    [ -n "$HOST" ] || [ -z "$MODE" ] || HOST="$(value_of "$ENV_FILE" AGENT_HOST)"
+  fi
+  [ -n "$API_KEY" ] || [ -n "${MIGRATRIX_API_KEY:-}" ] || API_KEY="$(value_of "$ENV_FILE" MIGRATRIX_API_KEY)"
+fi
+
 # A Linux machine without a graphical session: nobody will open a browser on it, so https://agent.localhost and a
 # certificate trusted only by this machine are of no use (onboarding trials AGI-03).
 is_headless() {

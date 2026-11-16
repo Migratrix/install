@@ -276,6 +276,20 @@ function Install-Migratrix {
         $script:Mode = $savedMode
     }
 
+    # -Replace on a machine that already holds an install is about that install: what the command leaves out (the
+    # mode with its host, the key) is read from it, as -Upgrade does. Without this a bare -Replace on a server
+    # stopped at "choose a mode" although the mode was already chosen (onboarding trials, round 5).
+    if ($Replace -and -not $Upgrade -and (Test-Path $EnvFile)) {
+        if (-not $Mode) {
+            $savedMode = Get-FileValue $EnvFile 'MIGRATRIX_MODE'
+            if ($savedMode -in @('localhost', 'managed', 'custom', 'ip')) {
+                $script:Mode = $savedMode
+                if (-not $HostName) { $script:HostName = Get-FileValue $EnvFile 'AGENT_HOST' }
+            }
+        }
+        if (-not $ApiKey -and -not $env:MIGRATRIX_API_KEY) { $script:ApiKey = Get-FileValue $EnvFile 'MIGRATRIX_API_KEY' }
+    }
+
     # --- secrets handed over by the non-elevated run ---------------------------
     if ($SecretsFile) {
         if (-not (Test-Path $SecretsFile)) { throw "The installer's hand-over file is missing; run the installer again." }
