@@ -393,6 +393,8 @@ if [ "$PORT_TAKEN" = "1" ]; then
 fi
 
 mkdir -p "$CERTS_DIR" "$DYNAMIC_DIR"
+# Where an operator puts the vendor drivers Migratrix does not ship; mounted read-only into the agent.
+mkdir -p "$REPO_ROOT/drivers/db2" "$REPO_ROOT/drivers/hana" "$REPO_ROOT/drivers/teradata"
 
 # Point Traefik's file provider at /certs/<basename> (+ matching -key.pem).
 write_tls() {

@@ -76,6 +76,8 @@ services:
       - migratrix-data:/data/migratrix
       - ./certs:/certs
       - ./traefik/dynamic:/etc/traefik/dynamic
+      # Vendor ADO.NET drivers Migratrix does not ship (IBM Db2, SAP HANA, Teradata): drivers/<engine>/ here, read-only.
+      - ./drivers:/opt/migratrix/drivers:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

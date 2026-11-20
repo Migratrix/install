@@ -446,6 +446,8 @@ This is Windows Server: the default mode (localhost) would give an agent that on
     $DynamicDir = Join-Path $RepoRoot 'traefik\dynamic'
     $TlsFile    = Join-Path $DynamicDir 'tls.yml'
     New-Item -ItemType Directory -Force -Path $CertsDir, $DynamicDir | Out-Null
+    # Where an operator puts the vendor drivers Migratrix does not ship; mounted read-only into the agent.
+    New-Item -ItemType Directory -Force -Path (Join-Path $RepoRoot 'drivers\db2'), (Join-Path $RepoRoot 'drivers\hana'), (Join-Path $RepoRoot 'drivers\teradata') | Out-Null
 
     # --- TLS bootstrap (mode-specific) -----------------------------------------
     if ($Upgrade) {
