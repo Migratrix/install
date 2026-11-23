@@ -136,11 +136,19 @@ services:
     image: ${REGISTRY:-}migratrix-java-analyzer:${JAVA_ANALYZER_TAG:?JAVA_ANALYZER_TAG is not set in .env - run the installer, it writes the released image versions}
     container_name: migratrix-java-analyzer
     restart: unless-stopped
+    environment:
+      # The analyzer reads this variable to resolve the columns inside SQL strings (JDBC, MyBatis, Hibernate,
+      # Spring Data). Without it the log says "sqlglot=disabled" and every reference is stored table-only, so a
+      # column rename is reported clear.
+      SQLGLOT_BASE_URL: "http://sqlglot:5123"
+    depends_on:
+      - sqlglot
 
   python-analyzer:
     image: ${REGISTRY:-}migratrix-python-analyzer:${PYTHON_ANALYZER_TAG:?PYTHON_ANALYZER_TAG is not set in .env - run the installer, it writes the released image versions}
     container_name: migratrix-python-analyzer
     restart: unless-stopped
+    # No sqlglot address: this analyzer imports the sqlglot library (requirements.txt) and parses SQL in-process.
 
   sqlglot:
     image: ${REGISTRY:-}migratrix-sqlglot-parser:${SQLGLOT_TAG:?SQLGLOT_TAG is not set in .env - run the installer, it writes the released image versions}
